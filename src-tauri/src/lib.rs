@@ -17,7 +17,10 @@ use notify_debouncer_mini::{
 };
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{
+    menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder},
+    AppHandle, Emitter, Manager,
+};
 use uuid::Uuid;
 
 #[derive(Default)]
@@ -179,10 +182,7 @@ fn add_folder_dialog(
     let config_path = folder_roots_config_path()?;
 
     let was_duplicate = {
-        let mut folders = state
-            .folders
-            .lock()
-            .map_err(|_| "无法锁定目录收藏。")?;
+        let mut folders = state.folders.lock().map_err(|_| "无法锁定目录收藏。")?;
         if folders
             .roots
             .iter()
@@ -211,8 +211,21 @@ fn add_folder_dialog(
 }
 
 #[tauri::command]
-fn list_folder_tree(state: tauri::State<'_, AppState>) -> Result<Vec<FolderRoot>, String> {
-    folder_tree_snapshot(&state)
+fn list_folder_tree(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<Vec<FolderRoot>, String> {
+    let snapshot = folder_tree_snapshot(&state)?;
+    if snapshot
+        .iter()
+        .any(|root| !root.available || root.error.is_some())
+    {
+        let mut folders = state.folders.lock().map_err(|_| "无法锁定目录收藏。")?;
+        sync_folder_watches(&mut folders, &app);
+        drop(folders);
+        return folder_tree_snapshot(&state);
+    }
+    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -225,10 +238,7 @@ fn remove_folder_root(
     let config_path = folder_roots_config_path()?;
 
     {
-        let mut folders = state
-            .folders
-            .lock()
-            .map_err(|_| "无法锁定目录收藏。")?;
+        let mut folders = state.folders.lock().map_err(|_| "无法锁定目录收藏。")?;
         let previous_roots = folders.roots.clone();
         remove_folder_root_record(&mut folders.roots, &requested_path)?;
         if let Err(error) = save_folder_roots_to_path(&config_path, &folders.roots) {
@@ -249,10 +259,7 @@ fn open_csv_from_folder(
     path: String,
 ) -> Result<TableDocument, String> {
     let roots = {
-        let folders = state
-            .folders
-            .lock()
-            .map_err(|_| "无法锁定目录收藏。")?;
+        let folders = state.folders.lock().map_err(|_| "无法锁定目录收藏。")?;
         folders.roots.clone()
     };
     let csv_path = validate_csv_path_in_roots(Path::new(&path), &roots)?;
@@ -518,8 +525,8 @@ const FOLDER_ROOTS_APP_DATA_DIRECTORY: &str = "com.dongyun.game-data-editor";
 const FOLDER_ROOTS_CONFIG_FILE: &str = "folder-roots.json";
 
 fn folder_roots_config_path() -> Result<PathBuf, String> {
-    let local_app_data = env::var_os("LOCALAPPDATA")
-        .ok_or("无法定位 %LOCALAPPDATA%，因此无法保存目录收藏。")?;
+    let local_app_data =
+        env::var_os("LOCALAPPDATA").ok_or("无法定位 %LOCALAPPDATA%，因此无法保存目录收藏。")?;
     Ok(PathBuf::from(local_app_data)
         .join(FOLDER_ROOTS_APP_DATA_DIRECTORY)
         .join(FOLDER_ROOTS_CONFIG_FILE))
@@ -542,8 +549,7 @@ fn save_folder_roots_to_path(path: &Path, roots: &[FolderRootRecord]) -> Result<
         roots: roots.to_vec(),
     })
     .map_err(|error| format!("无法序列化目录收藏：{error}"))?;
-    write_backup_and_replace(path, &content)
-        .map_err(|error| format!("无法保存目录收藏：{error}"))
+    write_backup_and_replace(path, &content).map_err(|error| format!("无法保存目录收藏：{error}"))
 }
 
 fn deduplicate_folder_roots(roots: Vec<FolderRootRecord>) -> Vec<FolderRootRecord> {
@@ -554,9 +560,7 @@ fn deduplicate_folder_roots(roots: Vec<FolderRootRecord>) -> Vec<FolderRootRecor
         .filter_map(|root| {
             let path = canonical_directory_path(&root.path).unwrap_or(root.path);
             let key = folder_path_key(&path);
-            known_paths
-                .insert(key)
-                .then_some(FolderRootRecord { path })
+            known_paths.insert(key).then_some(FolderRootRecord { path })
         })
         .collect()
 }
@@ -607,10 +611,7 @@ fn remove_folder_root_record(
 
 fn folder_tree_snapshot(state: &AppState) -> Result<Vec<FolderRoot>, String> {
     let (roots, watch_errors) = {
-        let folders = state
-            .folders
-            .lock()
-            .map_err(|_| "无法锁定目录收藏。")?;
+        let folders = state.folders.lock().map_err(|_| "无法锁定目录收藏。")?;
         (folders.roots.clone(), folders.watch_errors.clone())
     };
     Ok(build_folder_tree(&roots, &watch_errors))
@@ -667,8 +668,8 @@ fn combine_folder_errors(existing: Option<String>, next: String) -> Option<Strin
 }
 
 fn scan_directory_children(path: &Path) -> Result<Vec<FolderTreeEntry>, String> {
-    let entries = fs::read_dir(path)
-        .map_err(|error| format!("无法读取目录 {}：{error}", path.display()))?;
+    let entries =
+        fs::read_dir(path).map_err(|error| format!("无法读取目录 {}：{error}", path.display()))?;
     let mut folders = Vec::new();
     let mut csv_files = Vec::new();
 
@@ -692,12 +693,20 @@ fn scan_directory_children(path: &Path) -> Result<Vec<FolderTreeEntry>, String> 
         if file_type.is_dir() {
             match dir_entry_is_symlink_or_reparse(&entry, &file_type) {
                 Ok(true) => continue,
-                Ok(false) => folders.push(scan_folder_entry(&child_path)),
+                Ok(false) => {
+                    let folder = scan_folder_entry(&child_path);
+                    if folder.error.is_some() || !folder.children.is_empty() {
+                        folders.push(folder);
+                    }
+                }
                 Err(error) => folders.push(unavailable_folder_entry(&child_path, error)),
             }
         } else if file_type.is_file()
             && is_csv_path(&child_path)
-            && matches!(dir_entry_is_symlink_or_reparse(&entry, &file_type), Ok(false))
+            && matches!(
+                dir_entry_is_symlink_or_reparse(&entry, &file_type),
+                Ok(false)
+            )
         {
             csv_files.push(FolderTreeEntry {
                 name: path_display_name(&child_path),
@@ -831,8 +840,15 @@ fn sync_folder_watches(folders: &mut FolderState, app: &AppHandle) {
     };
 
     for root in &folders.roots {
-        let Ok(path) = canonical_directory_path(&root.path) else {
-            continue;
+        let path = match canonical_directory_path(&root.path) {
+            Ok(path) => path,
+            Err(error) => {
+                folders.watch_errors.insert(
+                    folder_path_key(&root.path),
+                    format!("无法监听目录变化：{error}"),
+                );
+                continue;
+            }
         };
         if let Err(error) = watcher.watcher().watch(&path, RecursiveMode::Recursive) {
             folders.watch_errors.insert(
@@ -878,8 +894,8 @@ fn validate_csv_path_in_roots(
     let canonical_path = requested_path
         .canonicalize()
         .map_err(|error| format!("无法访问 CSV 文件：{error}"))?;
-    let metadata = fs::metadata(&canonical_path)
-        .map_err(|error| format!("无法读取 CSV 文件：{error}"))?;
+    let metadata =
+        fs::metadata(&canonical_path).map_err(|error| format!("无法读取 CSV 文件：{error}"))?;
     if !metadata.is_file() || !is_csv_path(&canonical_path) {
         return Err("请选择已收藏目录中的普通 .csv 文件。".to_string());
     }
@@ -915,10 +931,7 @@ fn initialize_folder_state(app: &AppHandle) -> Result<(), String> {
     let config_path = folder_roots_config_path()?;
     let roots = load_folder_roots_from_path(&config_path)?;
     let state = app.state::<AppState>();
-    let mut folders = state
-        .folders
-        .lock()
-        .map_err(|_| "无法锁定目录收藏。")?;
+    let mut folders = state.folders.lock().map_err(|_| "无法锁定目录收藏。")?;
     folders.roots = roots;
     sync_folder_watches(&mut folders, app);
     Ok(())
@@ -1431,6 +1444,26 @@ fn issue(
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
+        .menu(|app| {
+            let new_csv = MenuItemBuilder::with_id("file-new", "新建 CSV").build(app)?;
+            let open_csv = MenuItemBuilder::with_id("file-open", "打开 CSV").build(app)?;
+            let save = MenuItemBuilder::with_id("file-save", "保存")
+                .accelerator("Ctrl+S")
+                .build(app)?;
+            let export = MenuItemBuilder::with_id("file-export", "导出数据包").build(app)?;
+            let file_menu = SubmenuBuilder::new(app, "&File")
+                .items(&[&new_csv, &open_csv])
+                .separator()
+                .items(&[&save, &export])
+                .build()?;
+            MenuBuilder::new(app).item(&file_menu).build()
+        })
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "file-new" | "file-open" | "file-save" | "file-export" => {
+                let _ = app.emit("file-menu-action", event.id().as_ref().to_string());
+            }
+            _ => {}
+        })
         .setup(|app| {
             if let Err(error) = initialize_folder_state(&app.handle()) {
                 eprintln!("无法初始化目录收藏：{error}");
@@ -1460,6 +1493,13 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_directory(label: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("game-data-editor-{label}-{}", Uuid::new_v4()));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
 
     #[test]
     fn uuid_reference_requires_lowercase_v4() {
@@ -1603,6 +1643,155 @@ mod tests {
         assert!(!root.join("items.csv.bak").exists());
         assert!(!root.join("items.schema.json.bak").exists());
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn folder_tree_recurses_filters_csv_and_sorts_directories_first() {
+        let root = test_directory("folder-tree");
+        let data_dir = root.join("Data");
+        let nested_dir = data_dir.join("Nested");
+        let z_dir = root.join("z-last");
+        fs::create_dir_all(&nested_dir).unwrap();
+        fs::create_dir_all(&z_dir).unwrap();
+        fs::write(root.join("beta.CSV"), b"id\n").unwrap();
+        fs::write(root.join("Alpha.csv"), b"id\n").unwrap();
+        fs::write(root.join("notes.txt"), b"ignored").unwrap();
+        fs::write(nested_dir.join("Hero.CsV"), b"id\n").unwrap();
+        fs::write(nested_dir.join("Hero.schema.json"), b"{}").unwrap();
+
+        let canonical_root = root.canonicalize().unwrap();
+        let roots = vec![FolderRootRecord {
+            path: canonical_root,
+        }];
+        let tree = build_folder_tree(&roots, &HashMap::new());
+
+        assert_eq!(tree.len(), 1);
+        assert!(tree[0].available);
+        let names = tree[0]
+            .children
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["Data", "Alpha.csv", "beta.CSV"]);
+        assert!(!names.contains(&"z-last"));
+
+        let data = &tree[0].children[0];
+        assert!(matches!(data.kind, FolderEntryKind::Folder));
+        let nested = data
+            .children
+            .iter()
+            .find(|entry| entry.name == "Nested")
+            .unwrap();
+        assert_eq!(nested.children.len(), 1);
+        assert_eq!(nested.children[0].name, "Hero.CsV");
+        assert!(matches!(nested.children[0].kind, FolderEntryKind::Csv));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn folder_config_deduplicates_and_keeps_missing_roots() {
+        let root = test_directory("folder-config");
+        let existing = root.join("existing");
+        let missing = root.join("missing");
+        fs::create_dir_all(&existing).unwrap();
+        let canonical_existing = existing.canonicalize().unwrap();
+        let config_path = root.join("state").join(FOLDER_ROOTS_CONFIG_FILE);
+        let records = vec![
+            FolderRootRecord {
+                path: canonical_existing.clone(),
+            },
+            FolderRootRecord {
+                path: canonical_existing.clone(),
+            },
+            FolderRootRecord {
+                path: missing.clone(),
+            },
+        ];
+
+        save_folder_roots_to_path(&config_path, &records).unwrap();
+        let loaded = load_folder_roots_from_path(&config_path).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].path, canonical_existing);
+        assert_eq!(loaded[1].path, missing);
+
+        let tree = build_folder_tree(&loaded, &HashMap::new());
+        assert!(tree[0].available);
+        assert!(!tree[1].available);
+        assert!(tree[1].error.is_some());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn removing_folder_record_never_deletes_disk_content() {
+        let root = test_directory("folder-remove");
+        let csv_path = root.join("items.csv");
+        fs::write(&csv_path, b"id\n").unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+        let mut records = vec![FolderRootRecord {
+            path: canonical_root.clone(),
+        }];
+
+        remove_folder_root_record(&mut records, &canonical_root).unwrap();
+
+        assert!(records.is_empty());
+        assert!(root.is_dir());
+        assert!(csv_path.is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn csv_path_must_be_a_regular_file_inside_a_managed_root() {
+        let base = test_directory("folder-path-boundary");
+        let managed = base.join("managed");
+        fs::create_dir_all(&managed).unwrap();
+        let inside = managed.join("inside.CSV");
+        let outside = base.join("outside.csv");
+        fs::write(&inside, b"id\n").unwrap();
+        fs::write(&outside, b"id\n").unwrap();
+        let roots = vec![FolderRootRecord {
+            path: managed.canonicalize().unwrap(),
+        }];
+
+        assert_eq!(
+            validate_csv_path_in_roots(&inside, &roots).unwrap(),
+            inside.canonicalize().unwrap()
+        );
+        assert!(validate_csv_path_in_roots(&outside, &roots).is_err());
+        assert!(validate_csv_path_in_roots(&managed, &roots).is_err());
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recursive_watcher_reports_nested_file_changes() {
+        let root = test_directory("folder-watch");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut watcher = new_debouncer(
+            Duration::from_millis(100),
+            move |result: DebounceEventResult| {
+                let _ = sender.send(result);
+            },
+        )
+        .unwrap();
+        watcher
+            .watcher()
+            .watch(&root, RecursiveMode::Recursive)
+            .unwrap();
+
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("new.csv"), b"id\n").unwrap();
+
+        let event = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("directory watcher did not report a nested change");
+        assert!(event.is_ok());
+
+        drop(watcher);
         fs::remove_dir_all(root).unwrap();
     }
 }

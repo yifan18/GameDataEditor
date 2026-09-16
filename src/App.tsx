@@ -1,20 +1,38 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { getCurrentWindow } from '@tauri-apps/api/window';
+import { IconButton, Theme } from '@radix-ui/themes';
+import {
+  columnFilteringFeature,
+  createColumnHelper,
+  createFilteredRowModel,
+  createSortedRowModel,
+  filterFn_includesString,
+  globalFilteringFeature,
+  rowSortingFeature,
+  tableFeatures,
+  useTable,
+} from '@tanstack/react-table';
 import {
   AlertCircle,
+  ArrowDown,
+  ArrowUp,
   ChevronDown,
   ChevronRight,
+  ChevronsUpDown,
   Copy,
-  Download,
   FileText,
   FileJson,
   FileSpreadsheet,
   Folder,
   FolderOpen,
+  FilterX,
   LoaderCircle,
+  Moon,
   Plus,
   RefreshCw,
-  Save,
+  Search,
+  Sun,
   Trash2,
   X,
 } from 'lucide-react';
@@ -42,6 +60,40 @@ const columnTypes: Array<{ value: ColumnType; label: string }> = [
 
 const makeRow = (columnCount: number) => Array.from({ length: columnCount }, () => '');
 
+const dataGridFeatures = tableFeatures({
+  columnFilteringFeature,
+  globalFilteringFeature,
+  rowSortingFeature,
+  filteredRowModel: createFilteredRowModel(),
+  sortedRowModel: createSortedRowModel(),
+});
+
+interface DataGridRow {
+  sourceIndex: number;
+  values: string[];
+}
+
+const dataGridColumnHelper = createColumnHelper<typeof dataGridFeatures, DataGridRow>();
+
+function compareCellValues(type: ColumnType, left: unknown, right: unknown) {
+  const leftText = String(left ?? '');
+  const rightText = String(right ?? '');
+
+  if (type === 'int' || type === 'float') {
+    const leftNumber = Number(leftText);
+    const rightNumber = Number(rightText);
+    if (Number.isFinite(leftNumber) && Number.isFinite(rightNumber)) return leftNumber - rightNumber;
+  }
+
+  if (type === 'bool') {
+    const rank = (value: string) => value.toLowerCase() === 'true' ? 1 : value.toLowerCase() === 'false' ? 0 : -1;
+    const difference = rank(leftText) - rank(rightText);
+    if (difference !== 0) return difference;
+  }
+
+  return leftText.localeCompare(rightText, undefined, { numeric: true, sensitivity: 'base' });
+}
+
 interface HeaderMenuState {
   index: number;
   x: number;
@@ -53,6 +105,14 @@ interface ColumnDialogState {
   index: number;
 }
 
+type AppAppearance = 'light' | 'dark';
+
+function initialAppearance(): AppAppearance {
+  const stored = window.localStorage.getItem('game-data-editor-appearance');
+  if (stored === 'light' || stored === 'dark') return stored;
+  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+
 function cloneDocument(document: TableDocument): TableDocument {
   return {
     ...document,
@@ -62,6 +122,7 @@ function cloneDocument(document: TableDocument): TableDocument {
 }
 
 export default function App() {
+  const [appearance, setAppearance] = useState<AppAppearance>(initialAppearance);
   const [document, setDocument] = useState<TableDocument | null>(null);
   const [savedSnapshot, setSavedSnapshot] = useState('');
   const [issues, setIssues] = useState<ValidationIssue[]>([]);
@@ -69,15 +130,21 @@ export default function App() {
   const [folderRoots, setFolderRoots] = useState<FolderTreeRoot[]>([]);
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
   const [activeCsvPath, setActiveCsvPath] = useState<string | null>(null);
-  const [notice, setNotice] = useState('打开一个 CSV 文件开始编辑。');
+  const [, setNotice] = useState('打开一个 CSV 文件开始编辑。');
   const [isBusy, setIsBusy] = useState(false);
   const [isFolderTreeLoading, setIsFolderTreeLoading] = useState(true);
   const [isFolderActionBusy, setIsFolderActionBusy] = useState(false);
   const [headerMenu, setHeaderMenu] = useState<HeaderMenuState | null>(null);
   const [columnDialog, setColumnDialog] = useState<ColumnDialogState | null>(null);
+  const fileMenuActions = useRef<Record<string, () => void>>({});
   const knownFolderRoots = useRef(new Set<string>());
 
   const isDirty = document !== null && JSON.stringify(document) !== savedSnapshot;
+
+  useEffect(() => {
+    window.localStorage.setItem('game-data-editor-appearance', appearance);
+    window.document.documentElement.style.colorScheme = appearance;
+  }, [appearance]);
   const issueByCell = useMemo(() => {
     const index = new Map<string, ValidationIssue[]>();
     issues.forEach((issue) => {
@@ -87,6 +154,39 @@ export default function App() {
     });
     return index;
   }, [issues]);
+  const tableRows = useMemo<DataGridRow[]>(
+    () => document?.rows.map((values, sourceIndex) => ({ sourceIndex, values })) ?? [],
+    [document?.rows],
+  );
+  const columnSchemaSignature = JSON.stringify(document?.schema.columns ?? []);
+  const tableColumns = useMemo(() => dataGridColumnHelper.columns(
+    (document?.schema.columns ?? []).map((column, columnIndex) => dataGridColumnHelper.accessor(
+      (row) => row.values[columnIndex] || undefined,
+      {
+        id: column.name,
+        header: column.name,
+        filterFn: filterFn_includesString,
+        sortDescFirst: false,
+        sortUndefined: 'last',
+        sortFn: (rowA, rowB, columnId) => compareCellValues(
+          column.type,
+          rowA.getValue(columnId),
+          rowB.getValue(columnId),
+        ),
+      },
+    )),
+  ), [columnSchemaSignature]);
+  const dataTable = useTable({
+    features: dataGridFeatures,
+    columns: tableColumns,
+    data: tableRows,
+    globalFilterFn: filterFn_includesString,
+    getRowId: (row) => String(row.sourceIndex),
+  });
+  const folderWatchNeedsRetry = useMemo(
+    () => folderRoots.some((root) => !root.available || Boolean(root.error)),
+    [folderRoots],
+  );
 
   useEffect(() => {
     if (!document) {
@@ -106,11 +206,26 @@ export default function App() {
   }, [document]);
 
   useEffect(() => {
+    dataTable.resetSorting(true);
+    dataTable.resetColumnFilters(true);
+    dataTable.resetGlobalFilter(true);
+  }, [activeCsvPath, document?.tableName, columnSchemaSignature]);
+
+  useEffect(() => {
     if (!headerMenu) return;
     const closeMenu = () => setHeaderMenu(null);
     window.addEventListener('mousedown', closeMenu);
     return () => window.removeEventListener('mousedown', closeMenu);
   }, [headerMenu]);
+
+  useEffect(() => {
+    const csvName = document ? `${document.tableName}.csv` : null;
+    const title = csvName ? `${csvName} — Game Data Editor` : 'Game Data Editor';
+    window.document.title = title;
+    void getCurrentWindow().setTitle(title).catch(() => {
+      // The browser-only development preview has no native Tauri window.
+    });
+  }, [document?.tableName]);
 
   const refreshFolderTree = useCallback(async (showLoading = false) => {
     if (showLoading) setIsFolderTreeLoading(true);
@@ -177,6 +292,14 @@ export default function App() {
     };
   }, [refreshFolderTree]);
 
+  useEffect(() => {
+    if (!folderWatchNeedsRetry) return;
+    const interval = window.setInterval(() => {
+      void refreshFolderTree();
+    }, 5_000);
+    return () => window.clearInterval(interval);
+  }, [folderWatchNeedsRetry, refreshFolderTree]);
+
   const openDocument = useCallback(async (
     loader: () => Promise<TableDocument | null>,
     sourcePath: string | null,
@@ -228,6 +351,12 @@ export default function App() {
     setIsFolderActionBusy(true);
     try {
       setFolderRoots(await api.removeManagedFolder(root.path));
+      knownFolderRoots.current.delete(root.path);
+      setExpandedFolders((current) => {
+        const next = new Set(current);
+        next.delete(root.path);
+        return next;
+      });
       setNotice(`已从文件夹列表移除 “${root.name}”。`);
     } catch (error) {
       setNotice(`无法移除文件夹：${messageFrom(error)}`);
@@ -262,8 +391,8 @@ export default function App() {
     }
   };
 
-  const save = async () => {
-    if (!document) return;
+  const save = useCallback(async () => {
+    if (!document || isBusy) return;
     const documentToSave = { ...document, schemaWasMissing: false };
     setIsBusy(true);
     try {
@@ -281,7 +410,7 @@ export default function App() {
     } finally {
       setIsBusy(false);
     }
-  };
+  }, [document, isBusy]);
 
   const exportPackage = async () => {
     if (!document) return;
@@ -457,41 +586,45 @@ export default function App() {
     }
   };
 
+  fileMenuActions.current = {
+    'file-new': () => { if (!isBusy) void createCsv(); },
+    'file-open': () => { if (!isBusy) void openCsv(); },
+    'file-save': () => { if (isDirty && !isBusy) void save(); },
+    'file-export': () => { if (document && !isBusy) void exportPackage(); },
+  };
+
+  useEffect(() => {
+    let active = true;
+    let unlisten: UnlistenFn | undefined;
+    void listen<string>('file-menu-action', (event) => {
+      fileMenuActions.current[event.payload]?.();
+    }).then((removeListener) => {
+      if (active) unlisten = removeListener;
+      else removeListener();
+    });
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, []);
+
+  const visibleTableRows = dataTable.getRowModel().rows;
+  const visibleSourceIndices = visibleTableRows.map((row) => row.original.sourceIndex);
+  const allVisibleRowsSelected = visibleSourceIndices.length > 0
+    && visibleSourceIndices.every((sourceIndex) => selectedRows.has(sourceIndex));
+  const hasActiveFilters = Boolean(dataTable.state.globalFilter)
+    || dataTable.state.columnFilters.length > 0;
+
   return (
+    <Theme
+      appearance={appearance}
+      accentColor="gray"
+      grayColor="gray"
+      panelBackground="solid"
+      radius="small"
+      scaling="90%"
+    >
     <main className="app-shell">
-      <header className="topbar">
-        <div className="brand">
-          <span className="brand-mark"><FileSpreadsheet size={20} /></span>
-          <div>
-            <strong>Game Data Editor</strong>
-            <span>{document ? `${document.tableName}.csv` : '本地 CSV 数据包编辑器'}</span>
-          </div>
-        </div>
-        <div className="toolbar">
-          <button className="button button-secondary" onClick={createCsv} disabled={isBusy}>
-            <Plus size={16} /> 新建 CSV
-          </button>
-          <button className="button button-secondary" onClick={openCsv} disabled={isBusy}>
-            <FolderOpen size={16} /> 打开 CSV
-          </button>
-          <button className="button button-secondary" onClick={exportPackage} disabled={!document || isBusy}>
-            <Download size={16} /> 导出数据包
-          </button>
-          <button className="button button-primary" onClick={save} disabled={!document || !isDirty || isBusy}>
-            {isBusy ? <LoaderCircle className="spin" size={16} /> : <Save size={16} />}
-            保存{isDirty ? ' *' : ''}
-          </button>
-        </div>
-      </header>
-
-      <section className="statusbar" aria-live="polite">
-        <span className={issues.length ? 'status-error' : 'status-neutral'}>
-          {issues.length ? <AlertCircle size={15} /> : <FileJson size={15} />}
-          {issues.length ? `${issues.length} 个校验问题` : notice}
-        </span>
-        {document && <span>{document.rows.length} 行 · {document.schema.columns.length} 列</span>}
-      </section>
-
       <div className="app-content">
         <FolderSidebar
           roots={folderRoots}
@@ -505,6 +638,8 @@ export default function App() {
           onRemoveFolder={removeFolder}
           onToggleFolder={toggleFolder}
           onOpenCsv={openCsvAtPath}
+          appearance={appearance}
+          onToggleAppearance={() => setAppearance((current) => current === 'dark' ? 'light' : 'dark')}
         />
         <section className="editor-content">
           {!document ? (
@@ -535,36 +670,114 @@ export default function App() {
                   <button className="button button-secondary" onClick={duplicateSelected} disabled={selectedRows.size !== 1 || isBusy}><Copy size={16} />复制行</button>
                   <button className="button button-danger" onClick={deleteSelected} disabled={selectedRows.size === 0}><Trash2 size={16} />删除行</button>
                   <button className="button button-secondary" onClick={cleanOrphans} disabled={isBusy}><Trash2 size={16} />清理未引用 JSON</button>
-                  <span className="grid-hint">复制行会复制 JSON 文件并生成新 UUID。</span>
+                  <div className="table-tools">
+                    <label className="global-filter">
+                      <Search size={14} />
+                      <input
+                        value={String(dataTable.state.globalFilter ?? '')}
+                        onChange={(event) => dataTable.setGlobalFilter(event.target.value)}
+                        placeholder="搜索全部列"
+                        aria-label="搜索全部列"
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      className="button button-secondary filter-reset"
+                      disabled={!hasActiveFilters}
+                      onClick={() => {
+                        dataTable.resetGlobalFilter(true);
+                        dataTable.resetColumnFilters(true);
+                      }}
+                    >
+                      <FilterX size={14} />清除筛选
+                    </button>
+                    <span className="filtered-row-count">显示 {visibleTableRows.length} / {document.rows.length} 行</span>
+                  </div>
                 </div>
                 <div className="table-scroll">
                   <table className="data-grid">
                     <thead>
-                      <tr>
-                        <th className="select-column"><input type="checkbox" aria-label="全选行" checked={document.rows.length > 0 && selectedRows.size === document.rows.length} onChange={(event) => setSelectedRows(event.target.checked ? new Set(document.rows.map((_, index) => index)) : new Set())} /></th>
-                        <th className="index-column">#</th>
-                        {document.schema.columns.map((column, index) => <th className="header-menu-trigger" onContextMenu={(event) => openHeaderMenu(event, index)} key={column.name}><span>{column.name}</span><small>{typeLabel(column.type)} · 右键操作</small></th>)}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {document.rows.map((row, rowIndex) => (
-                        <tr key={rowIndex} className={selectedRows.has(rowIndex) ? 'is-selected' : ''}>
-                          <td className="select-column"><input type="checkbox" aria-label={`选择第 ${rowIndex + 1} 行`} checked={selectedRows.has(rowIndex)} onChange={() => setSelectedRows((current) => { const next = new Set(current); next.has(rowIndex) ? next.delete(rowIndex) : next.add(rowIndex); return next; })} /></td>
-                          <td className="index-column">{rowIndex + 1}</td>
-                          {document.schema.columns.map((column, columnIndex) => (
-                            <td key={`${rowIndex}-${column.name}`} className={issueByCell.has(`${rowIndex}:${column.name}`) ? 'has-error' : ''} title={issueByCell.get(`${rowIndex}:${column.name}`)?.map((issue) => issue.message).join('\n')}>
-                              <CellEditor
-                                column={column}
-                                value={row[columnIndex] ?? ''}
-                                onChange={(value) => updateCell(rowIndex, columnIndex, value)}
-                                onCreateReference={() => createReference(rowIndex, columnIndex)}
-                                onOpenReference={() => openReference(row[columnIndex])}
-                                disabled={isBusy}
-                              />
-                            </td>
-                          ))}
+                      {dataTable.getHeaderGroups().map((headerGroup) => (
+                        <tr key={headerGroup.id}>
+                          <th className="select-column">
+                            <input
+                              type="checkbox"
+                              aria-label="选择当前筛选结果中的全部行"
+                              checked={allVisibleRowsSelected}
+                              onChange={(event) => {
+                                const checked = event.target.checked;
+                                setSelectedRows((current) => {
+                                  const next = new Set(current);
+                                  visibleSourceIndices.forEach((sourceIndex) => checked ? next.add(sourceIndex) : next.delete(sourceIndex));
+                                  return next;
+                                });
+                              }}
+                            />
+                          </th>
+                          <th className="index-column" title="CSV 中的原始行号">#</th>
+                          {headerGroup.headers.map((header, columnIndex) => {
+                            const column = document.schema.columns[columnIndex];
+                            const sortDirection = header.column.getIsSorted();
+                            return (
+                              <th
+                                className="header-menu-trigger"
+                                onContextMenu={(event) => openHeaderMenu(event, columnIndex)}
+                                key={header.id}
+                                aria-sort={sortDirection === 'asc' ? 'ascending' : sortDirection === 'desc' ? 'descending' : 'none'}
+                              >
+                                <button
+                                  type="button"
+                                  className="column-sort-button"
+                                  onClick={header.column.getToggleSortingHandler()}
+                                  title="点击排序；Shift + 点击可进行多列排序"
+                                >
+                                  <span>{column.name}</span>
+                                  {sortDirection === 'asc' ? <ArrowUp size={13} /> : sortDirection === 'desc' ? <ArrowDown size={13} /> : <ChevronsUpDown size={13} />}
+                                  {sortDirection && dataTable.state.sorting.length > 1 && (
+                                    <sup>{header.column.getSortIndex() + 1}</sup>
+                                  )}
+                                </button>
+                                <small>{typeLabel(column.type)}</small>
+                                <input
+                                  className="column-filter-input"
+                                  value={String(header.column.getFilterValue() ?? '')}
+                                  onChange={(event) => header.column.setFilterValue(event.target.value)}
+                                  onContextMenu={(event) => event.stopPropagation()}
+                                  placeholder="筛选…"
+                                  aria-label={`筛选 ${column.name} 列`}
+                                />
+                              </th>
+                            );
+                          })}
                         </tr>
                       ))}
+                    </thead>
+                    <tbody>
+                      {visibleTableRows.map((tableRow) => {
+                        const rowIndex = tableRow.original.sourceIndex;
+                        const row = tableRow.original.values;
+                        return (
+                          <tr key={tableRow.id} className={selectedRows.has(rowIndex) ? 'is-selected' : ''}>
+                            <td className="select-column"><input type="checkbox" aria-label={`选择原始第 ${rowIndex + 1} 行`} checked={selectedRows.has(rowIndex)} onChange={() => setSelectedRows((current) => { const next = new Set(current); next.has(rowIndex) ? next.delete(rowIndex) : next.add(rowIndex); return next; })} /></td>
+                            <td className="index-column">{rowIndex + 1}</td>
+                            {document.schema.columns.map((column, columnIndex) => (
+                              <td key={`${rowIndex}-${column.name}`} className={issueByCell.has(`${rowIndex}:${column.name}`) ? 'has-error' : ''} title={issueByCell.get(`${rowIndex}:${column.name}`)?.map((issue) => issue.message).join('\n')}>
+                                <CellEditor
+                                  column={column}
+                                  value={row[columnIndex] ?? ''}
+                                  onChange={(value) => updateCell(rowIndex, columnIndex, value)}
+                                  onCreateReference={() => createReference(rowIndex, columnIndex)}
+                                  onOpenReference={() => openReference(row[columnIndex])}
+                                  disabled={isBusy}
+                                />
+                              </td>
+                            ))}
+                          </tr>
+                        );
+                      })}
+                      {visibleTableRows.length === 0 && (
+                        <tr><td className="no-filter-results" colSpan={document.schema.columns.length + 2}>没有符合当前筛选条件的数据</td></tr>
+                      )}
                     </tbody>
                   </table>
                 </div>
@@ -594,6 +807,7 @@ export default function App() {
         />
       )}
     </main>
+    </Theme>
   );
 }
 
@@ -609,6 +823,8 @@ function FolderSidebar({
   onRemoveFolder,
   onToggleFolder,
   onOpenCsv,
+  appearance,
+  onToggleAppearance,
 }: {
   roots: FolderTreeRoot[];
   expandedFolders: Set<string>;
@@ -621,12 +837,13 @@ function FolderSidebar({
   onRemoveFolder: (root: FolderTreeRoot) => Promise<void>;
   onToggleFolder: (path: string) => void;
   onOpenCsv: (path: string) => Promise<void | undefined>;
+  appearance: AppAppearance;
+  onToggleAppearance: () => void;
 }) {
   return <aside className="folder-sidebar" aria-label="文件夹">
     <div className="folder-sidebar-header">
       <div>
         <span className="folder-sidebar-title">Folders</span>
-        <span className="folder-sidebar-subtitle">已添加的 CSV 目录</span>
       </div>
       <div className="folder-sidebar-actions">
         <button
@@ -649,6 +866,19 @@ function FolderSidebar({
         >
           <RefreshCw className={isLoading ? 'spin' : undefined} size={15} />
         </button>
+        <IconButton
+          type="button"
+          className="sidebar-icon-button theme-toggle"
+          size="1"
+          variant="ghost"
+          color="gray"
+          highContrast
+          onClick={onToggleAppearance}
+          aria-label={appearance === 'dark' ? '切换到浅色主题' : '切换到深色主题'}
+          title={appearance === 'dark' ? '切换到浅色主题' : '切换到深色主题'}
+        >
+          {appearance === 'dark' ? <Sun size={15} /> : <Moon size={15} />}
+        </IconButton>
       </div>
     </div>
 
@@ -769,7 +999,7 @@ function FolderTreeItem({
   onOpenCsv: (path: string) => Promise<void | undefined>;
 }) {
   const indent = 13 + depth * 16;
-  const entryAvailable = (entry as FolderTreeEntry & { available?: boolean }).available !== false;
+  const entryAvailable = entry.available;
   if (entry.kind === 'csv') {
     return <>
       <button
