@@ -26,6 +26,7 @@ use uuid::Uuid;
 #[derive(Default)]
 struct AppState {
     session: Mutex<Option<TableSession>>,
+    session_cache: Mutex<HashMap<String, TableSession>>,
     folders: Mutex<FolderState>,
 }
 
@@ -99,9 +100,37 @@ struct FileFingerprint {
 #[serde(rename_all = "camelCase")]
 pub struct TableDocument {
     table_name: String,
+    source_path: String,
     schema: TableSchema,
     rows: Vec<Vec<String>>,
     schema_was_missing: bool,
+}
+
+fn set_active_session(state: &AppState, session: TableSession) -> Result<(), String> {
+    let mut active_session = state.session.lock().map_err(|_| "无法锁定当前文件会话。")?;
+    let mut cache = state
+        .session_cache
+        .lock()
+        .map_err(|_| "无法锁定文件会话缓存。")?;
+    if let Some(current) = active_session.as_ref() {
+        cache.insert(folder_path_key(&current.csv_path), current.clone());
+    }
+    cache.insert(folder_path_key(&session.csv_path), session.clone());
+    *active_session = Some(session);
+    Ok(())
+}
+
+#[tauri::command]
+fn activate_csv_session(state: tauri::State<'_, AppState>, path: String) -> Result<(), String> {
+    let key = folder_path_key(Path::new(&path));
+    let session = state
+        .session_cache
+        .lock()
+        .map_err(|_| "无法锁定文件会话缓存。")?
+        .get(&key)
+        .cloned()
+        .ok_or("找不到该 Tab 对应的文件会话，请重新打开文件。")?;
+    set_active_session(&state, session)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,8 +207,7 @@ fn open_csv_dialog(state: tauri::State<'_, AppState>) -> Result<Option<TableDocu
     };
 
     let (document, session) = load_table_package(&path)?;
-    let mut active_session = state.session.lock().map_err(|_| "无法锁定当前文件会话。")?;
-    *active_session = Some(session);
+    set_active_session(&state, session)?;
     Ok(Some(document))
 }
 
@@ -280,8 +308,7 @@ fn open_csv_from_folder(
     };
     let csv_path = validate_csv_path_in_roots(Path::new(&path), &roots)?;
     let (document, session) = load_table_package(&csv_path)?;
-    let mut active_session = state.session.lock().map_err(|_| "无法锁定当前文件会话。")?;
-    *active_session = Some(session);
+    set_active_session(&state, session)?;
     Ok(document)
 }
 
@@ -298,8 +325,12 @@ fn open_linked_row(
     table_name: String,
     row_id: String,
 ) -> Result<LinkedRowResult, String> {
-    let mut active_session = state.session.lock().map_err(|_| "无法锁定当前文件会话。")?;
-    let current_session = active_session.as_ref().ok_or("请先打开一个 CSV 文件。")?;
+    let current_session = state
+        .session
+        .lock()
+        .map_err(|_| "无法锁定当前文件会话。")?
+        .clone()
+        .ok_or("请先打开一个 CSV 文件。")?;
     let target_path = sibling_sheet_path(&current_session.csv_path, &table_name)?;
     let (document, target_session) = load_table_package(&target_path)?;
     let row_index = document
@@ -308,7 +339,7 @@ fn open_linked_row(
         .position(|row| row.first().map(String::as_str) == Some(row_id.as_str()))
         .ok_or_else(|| format!("{} 表中没有 id 为 {} 的行。", table_name, row_id))?;
     let path = target_session.csv_path.to_string_lossy().into_owned();
-    *active_session = Some(target_session);
+    set_active_session(&state, target_session)?;
     Ok(LinkedRowResult {
         document,
         path,
@@ -332,8 +363,7 @@ fn create_csv_dialog(state: tauri::State<'_, AppState>) -> Result<Option<TableDo
         selected_path.with_extension("csv")
     };
     let (document, session) = create_table_package(csv_path)?;
-    let mut active_session = state.session.lock().map_err(|_| "无法锁定当前文件会话。")?;
-    *active_session = Some(session);
+    set_active_session(&state, session)?;
     Ok(Some(document))
 }
 
@@ -350,6 +380,7 @@ fn create_table_package(csv_path: PathBuf) -> Result<(TableDocument, TableSessio
 
     let document = TableDocument {
         table_name,
+        source_path: path_to_string(&csv_path),
         schema: TableSchema {
             version: 1,
             primary_key: "id".to_string(),
@@ -389,9 +420,23 @@ fn validate_document(
     state: tauri::State<'_, AppState>,
     document: TableDocument,
 ) -> Result<Vec<ValidationIssue>, String> {
-    let active_session = state.session.lock().map_err(|_| "无法锁定当前文件会话。")?;
-    let session = active_session.as_ref().ok_or("请先打开一个 CSV 文件。")?;
-    Ok(validate_document_for_session(&document, session))
+    let document_key = folder_path_key(Path::new(&document.source_path));
+    let active_session = state
+        .session
+        .lock()
+        .map_err(|_| "无法锁定当前文件会话。")?
+        .clone();
+    let session = match active_session {
+        Some(session) if folder_path_key(&session.csv_path) == document_key => session,
+        _ => state
+            .session_cache
+            .lock()
+            .map_err(|_| "无法锁定文件会话缓存。")?
+            .get(&document_key)
+            .cloned()
+            .ok_or("找不到该 Tab 对应的文件会话，请重新打开文件。")?,
+    };
+    Ok(validate_document_for_session(&document, &session))
 }
 
 #[tauri::command]
@@ -1094,6 +1139,7 @@ fn load_table_package(csv_path: &Path) -> Result<(TableDocument, TableSession), 
 
     let document = TableDocument {
         table_name,
+        source_path: path_to_string(&csv_path),
         schema,
         rows,
         schema_was_missing,
@@ -1626,6 +1672,7 @@ pub fn run() {
             list_folder_tree,
             remove_folder_root,
             open_csv_from_folder,
+            activate_csv_session,
             list_sibling_sheets,
             open_linked_row,
             create_csv_dialog,
@@ -1696,6 +1743,7 @@ mod tests {
     fn id_is_required_and_unique() {
         let document = TableDocument {
             table_name: "items".to_string(),
+            source_path: String::new(),
             schema_was_missing: false,
             schema: TableSchema {
                 version: 1,
@@ -1727,6 +1775,7 @@ mod tests {
     fn extended_column_types_validate_their_structured_values() {
         let document = TableDocument {
             table_name: "skills".to_string(),
+            source_path: String::new(),
             schema_was_missing: false,
             schema: TableSchema {
                 version: 1,

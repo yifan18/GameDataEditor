@@ -26,6 +26,16 @@ input[type="checkbox"] { accent-color: var(--gray-12); }
 
 .app-content { height: 100%; min-height: 0; display: flex; overflow: hidden; }
 .editor-content { min-width: 0; min-height: 0; flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.sheet-tabs { min-width: 0; min-height: 38px; padding: 5px 6px 0; display: flex; align-items: flex-end; gap: 2px; overflow-x: auto; overflow-y: hidden; border-bottom: 1px solid var(--gray-6); background: var(--gray-2); }
+.sheet-tab { height: 32px; max-width: 220px; flex: 0 0 auto; display: flex; align-items: center; border: 1px solid var(--gray-6); border-bottom: 0; border-radius: var(--radius-2) var(--radius-2) 0 0; color: var(--gray-11); background: var(--gray-3); }
+.sheet-tab:hover { color: var(--gray-12); background: var(--gray-4); }
+.sheet-tab.is-active { color: var(--gray-12); background: var(--color-panel-solid); box-shadow: inset 0 2px var(--gray-12); }
+.sheet-tab-select { min-width: 0; height: 100%; padding: 0 4px 0 10px; display: flex; align-items: center; gap: 5px; border: 0; color: inherit; background: transparent; font-size: 11px; }
+.sheet-tab-select > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sheet-tab-select:focus-visible, .sheet-tab-close:focus-visible { outline: 2px solid var(--gray-9); outline-offset: -2px; }
+.sheet-tab-dirty { color: var(--amber-10); font-size: 16px; line-height: 1; }
+.sheet-tab-close { width: 27px; height: 100%; flex: 0 0 27px; padding: 0; display: grid; place-items: center; border: 0; color: var(--gray-10); background: transparent; }
+.sheet-tab-close:hover:not(:disabled) { color: var(--gray-12); background: var(--gray-a4); }
 .folder-sidebar { width: 248px; height: 100%; min-height: 0; flex: 0 0 248px; display: flex; flex-direction: column; overflow: hidden; border-right: 1px solid var(--gray-6); background: var(--gray-2); }
 .folder-sidebar-header { min-height: 52px; padding: 8px 8px 8px 12px; display: flex; align-items: center; justify-content: space-between; gap: 8px; border-bottom: 1px solid var(--gray-6); }
 .folder-sidebar-title, .folder-sidebar-subtitle { display: block; }
@@ -61,11 +71,7 @@ input[type="checkbox"] { accent-color: var(--gray-12); }
 .grid-actions { gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }
 .grid-hint { margin-left: auto; color: var(--gray-10); font-size: 11px; }
 .table-tools { min-width: 0; margin-left: auto; display: flex; align-items: center; gap: 6px; }
-.global-filter { width: 210px; height: 30px; padding: 0 8px; display: flex; align-items: center; gap: 6px; color: var(--gray-10); border: 1px solid var(--gray-6); border-radius: var(--radius-2); background: var(--color-surface); }
-.global-filter:focus-within { color: var(--gray-12); border-color: var(--gray-9); box-shadow: 0 0 0 2px var(--gray-a4); }
-.global-filter input { width: 100%; min-width: 0; color: var(--gray-12); outline: 0; border: 0; background: transparent; font-size: 11px; }
-.global-filter input::placeholder, .column-filter-input::placeholder { color: var(--gray-9); }
-.filter-reset { white-space: nowrap; }
+.column-filter-input::placeholder { color: var(--gray-9); }
 .filtered-row-count { min-width: 82px; color: var(--gray-10); font-size: 10px; text-align: right; white-space: nowrap; }
 .table-scroll { min-height: 0; flex: 1; overflow: auto; border: 1px solid var(--gray-6); border-radius: var(--radius-2); }
 .data-grid { min-width: 100%; border-spacing: 0; border-collapse: separate; font-size: 12px; }
@@ -94,7 +100,7 @@ input[type="checkbox"] { accent-color: var(--gray-12); }
 .data-grid td.has-error { box-shadow: inset 0 -2px var(--red-9); }
 .data-grid td.has-error.is-cell-selected { box-shadow: inset 0 0 0 2px var(--gray-10), inset 0 -3px var(--red-9); }
 .data-grid td.no-filter-results { height: 96px; color: var(--gray-10); text-align: center; background: var(--color-panel-solid); }
-.select-column, .index-column { width: 38px; min-width: 38px !important; text-align: center !important; color: var(--gray-10) !important; }
+.index-column { width: 38px; min-width: 38px !important; text-align: center !important; color: var(--gray-10) !important; }
 .cell-input { width: 100%; min-width: 108px; height: 27px; padding: 0 6px; color: var(--gray-12); outline: none; border: 1px solid transparent; border-radius: var(--radius-1); background: transparent; }
 .cell-value { min-width: 108px; min-height: 27px; padding: 4px 6px; line-height: 18px; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; user-select: none; cursor: default; }
 .cell-value.is-empty::after { content: '\00a0'; }
@@ -124,11 +130,12 @@ input[type="checkbox"] { accent-color: var(--gray-12); }
 .package-example code { padding: 4px 6px; color: var(--gray-11); border: 1px solid var(--gray-6); border-radius: var(--radius-1); background: var(--gray-2); font-size: 10px; }
 
 .spin { animation: spin .9s linear infinite; }
-.header-context-menu { position: fixed; z-index: 40; width: 200px; padding: 5px; border: 1px solid var(--gray-7); border-radius: var(--radius-2); background: var(--color-panel-solid); box-shadow: var(--shadow-4); }
+.header-context-menu, .row-context-menu { position: fixed; z-index: 40; width: 200px; padding: 5px; border: 1px solid var(--gray-7); border-radius: var(--radius-2); background: var(--color-panel-solid); box-shadow: var(--shadow-4); }
 .menu-heading { padding: 7px 8px 6px; color: var(--gray-12); font-size: 11px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .menu-heading span { margin-left: 4px; color: var(--gray-10); font-size: 9px; font-weight: 500; }
 .menu-locked { margin: 0 4px 4px; padding: 6px; color: var(--gray-11); border-radius: var(--radius-1); background: var(--gray-3); font-size: 10px; }
-.menu-item { width: 100%; padding: 7px 8px; border: 0; border-radius: var(--radius-1); color: var(--gray-12); background: transparent; text-align: left; font-size: 12px; }
+.menu-item { width: 100%; padding: 7px 8px; display: flex; align-items: center; gap: 7px; border: 0; border-radius: var(--radius-1); color: var(--gray-12); background: transparent; text-align: left; font-size: 12px; }
+.menu-item svg { flex: 0 0 auto; }
 .menu-item:hover:not(:disabled) { background: var(--gray-4); }
 .menu-item:disabled { color: var(--gray-9); opacity: 1; }
 .menu-divider { height: 1px; margin: 4px 2px; background: var(--gray-6); }

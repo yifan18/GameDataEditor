@@ -25,6 +25,7 @@ export interface TableSchema {
 
 export interface TableDocument {
   tableName: string;
+  sourcePath: string;
   schema: TableSchema;
   rows: string[][];
   schemaWasMissing: boolean;

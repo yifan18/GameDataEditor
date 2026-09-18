@@ -26,12 +26,10 @@ import {
   FileSpreadsheet,
   Folder,
   FolderOpen,
-  FilterX,
   LoaderCircle,
   Moon,
   Plus,
   RefreshCw,
-  Search,
   Sun,
   Trash2,
   X,
@@ -102,6 +100,12 @@ interface HeaderMenuState {
   y: number;
 }
 
+interface RowMenuState {
+  rowIndex: number;
+  x: number;
+  y: number;
+}
+
 interface ColumnDialogState {
   mode: 'edit' | 'add';
   index: number;
@@ -110,6 +114,20 @@ interface ColumnDialogState {
 interface CellPosition {
   rowPosition: number;
   columnIndex: number;
+}
+
+interface DocumentTab {
+  id: string;
+  title: string;
+  path: string;
+  dirty: boolean;
+}
+
+interface DocumentTabSession {
+  document: TableDocument;
+  savedSnapshot: string;
+  issues: ValidationIssue[];
+  undoHistory: TableDocument[];
 }
 
 const cellKey = (rowIndex: number, columnIndex: number) => `${rowIndex}:${columnIndex}`;
@@ -142,11 +160,14 @@ export default function App() {
   const [folderRoots, setFolderRoots] = useState<FolderTreeRoot[]>([]);
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
   const [activeCsvPath, setActiveCsvPath] = useState<string | null>(null);
+  const [tabs, setTabs] = useState<DocumentTab[]>([]);
+  const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [, setNotice] = useState('打开一个 CSV 文件开始编辑。');
   const [isBusy, setIsBusy] = useState(false);
   const [isFolderTreeLoading, setIsFolderTreeLoading] = useState(true);
   const [isFolderActionBusy, setIsFolderActionBusy] = useState(false);
   const [headerMenu, setHeaderMenu] = useState<HeaderMenuState | null>(null);
+  const [rowMenu, setRowMenu] = useState<RowMenuState | null>(null);
   const [columnDialog, setColumnDialog] = useState<ColumnDialogState | null>(null);
   const [siblingSheets, setSiblingSheets] = useState<string[]>([]);
   const [linkTargetRowIndex, setLinkTargetRowIndex] = useState<number | null>(null);
@@ -155,15 +176,34 @@ export default function App() {
   const knownFolderRoots = useRef(new Set<string>());
   const dragSelectionStart = useRef<CellPosition | null>(null);
   const documentRef = useRef<TableDocument | null>(null);
+  const savedSnapshotRef = useRef('');
+  const issuesRef = useRef<ValidationIssue[]>([]);
+  const tabSessions = useRef(new Map<string, DocumentTabSession>());
+  const activeTabIdRef = useRef<string | null>(null);
+  const nextTabId = useRef(1);
   const undoHistory = useRef<TableDocument[]>([]);
   const activeHistoryGroup = useRef<string | null>(null);
+
+  const syncActiveTab = useCallback((nextDocument: TableDocument) => {
+    const tabId = activeTabIdRef.current;
+    if (!tabId) return;
+    const session = tabSessions.current.get(tabId);
+    if (!session) return;
+    session.document = nextDocument;
+    session.undoHistory = undoHistory.current;
+    const dirty = JSON.stringify(nextDocument) !== session.savedSnapshot;
+    setTabs((current) => current.map((tab) => tab.id === tabId
+      ? { ...tab, title: `${nextDocument.tableName}.csv`, dirty }
+      : tab));
+  }, []);
 
   const replaceDocument = useCallback((next: TableDocument, clearUndoHistory = false) => {
     if (clearUndoHistory) undoHistory.current = [];
     activeHistoryGroup.current = null;
     documentRef.current = next;
     setDocumentState(next);
-  }, []);
+    syncActiveTab(next);
+  }, [syncActiveTab]);
 
   const changeDocument = useCallback((
     updater: (current: TableDocument) => TableDocument,
@@ -181,7 +221,8 @@ export default function App() {
     activeHistoryGroup.current = historyGroup ?? null;
     documentRef.current = next;
     setDocumentState(next);
-  }, []);
+    syncActiveTab(next);
+  }, [syncActiveTab]);
 
   const undoDocument = useCallback(() => {
     const previous = undoHistory.current.pop();
@@ -189,13 +230,109 @@ export default function App() {
     activeHistoryGroup.current = null;
     documentRef.current = previous;
     setDocumentState(previous);
+    syncActiveTab(previous);
     setSelectedRows(new Set());
     setSelectedCells(new Set());
     setEditingCell(null);
     setNotice('已撤销上一步修改。');
-  }, []);
+  }, [syncActiveTab]);
 
   const isDirty = document !== null && JSON.stringify(document) !== savedSnapshot;
+
+  const displayTab = useCallback((tabId: string) => {
+    const session = tabSessions.current.get(tabId);
+    if (!session) return;
+    activeTabIdRef.current = tabId;
+    setActiveTabId(tabId);
+    documentRef.current = session.document;
+    setDocumentState(session.document);
+    savedSnapshotRef.current = session.savedSnapshot;
+    setSavedSnapshot(session.savedSnapshot);
+    issuesRef.current = session.issues;
+    setIssues(session.issues);
+    undoHistory.current = session.undoHistory;
+    activeHistoryGroup.current = null;
+    setActiveCsvPath(session.document.sourcePath);
+    setSelectedRows(new Set());
+    setSelectedCells(new Set());
+    setEditingCell(null);
+    setHeaderMenu(null);
+    setRowMenu(null);
+    setColumnDialog(null);
+    setLinkTargetRowIndex(null);
+  }, []);
+
+  const activateTab = useCallback(async (tabId: string, activateBackend = true) => {
+    if (tabId === activeTabIdRef.current) return;
+    const session = tabSessions.current.get(tabId);
+    if (!session) return;
+    setIsBusy(true);
+    try {
+      if (activateBackend) await api.activateCsvSession(session.document.sourcePath);
+      displayTab(tabId);
+    } catch (error) {
+      setNotice(`无法切换 Sheet：${messageFrom(error)}`);
+    } finally {
+      setIsBusy(false);
+    }
+  }, [displayTab]);
+
+  const addDocumentTab = useCallback((opened: TableDocument, initialIssues: ValidationIssue[] = []) => {
+    const existing = [...tabSessions.current.entries()]
+      .find(([, session]) => session.document.sourcePath.toLowerCase() === opened.sourcePath.toLowerCase());
+    if (existing) {
+      displayTab(existing[0]);
+      return existing[0];
+    }
+
+    const id = `sheet-${nextTabId.current++}`;
+    const snapshot = JSON.stringify(opened);
+    const session: DocumentTabSession = {
+      document: opened,
+      savedSnapshot: snapshot,
+      issues: initialIssues,
+      undoHistory: [],
+    };
+    tabSessions.current.set(id, session);
+    setTabs((current) => [...current, {
+      id,
+      title: `${opened.tableName}.csv`,
+      path: opened.sourcePath,
+      dirty: false,
+    }]);
+    displayTab(id);
+    return id;
+  }, [displayTab]);
+
+  const closeTab = useCallback((tabId: string) => {
+    const closingIndex = tabs.findIndex((tab) => tab.id === tabId);
+    if (closingIndex < 0) return;
+    const closingTab = tabs[closingIndex];
+    if (closingTab.dirty && !window.confirm(`“${closingTab.title}” 有未保存修改，仍要关闭吗？`)) return;
+
+    const nextTabs = tabs.filter((tab) => tab.id !== tabId);
+    tabSessions.current.delete(tabId);
+    setTabs(nextTabs);
+    if (tabId !== activeTabIdRef.current) return;
+
+    const nextTab = nextTabs[Math.min(closingIndex, nextTabs.length - 1)];
+    if (nextTab) {
+      activeTabIdRef.current = null;
+      void activateTab(nextTab.id);
+      return;
+    }
+
+    activeTabIdRef.current = null;
+    setActiveTabId(null);
+    documentRef.current = null;
+    setDocumentState(null);
+    setSavedSnapshot('');
+    savedSnapshotRef.current = '';
+    setIssues([]);
+    issuesRef.current = [];
+    undoHistory.current = [];
+    setActiveCsvPath(null);
+  }, [activateTab, tabs]);
 
   useEffect(() => {
     window.localStorage.setItem('game-data-editor-appearance', appearance);
@@ -247,12 +384,20 @@ export default function App() {
   useEffect(() => {
     if (!document) {
       setIssues([]);
+      issuesRef.current = [];
       return;
     }
 
+    const validatingTabId = activeTabIdRef.current;
     const timeout = window.setTimeout(async () => {
       try {
-        setIssues(await api.validate(document));
+        const nextIssues = await api.validate(document);
+        const session = validatingTabId ? tabSessions.current.get(validatingTabId) : undefined;
+        if (session) session.issues = nextIssues;
+        if (validatingTabId === activeTabIdRef.current) {
+          issuesRef.current = nextIssues;
+          setIssues(nextIssues);
+        }
       } catch (error) {
         setNotice(`校验失败：${messageFrom(error)}`);
       }
@@ -265,14 +410,27 @@ export default function App() {
     dataTable.resetSorting(true);
     dataTable.resetColumnFilters(true);
     dataTable.resetGlobalFilter(true);
-  }, [activeCsvPath, document?.tableName, columnSchemaSignature]);
+  }, [activeTabId, document?.tableName, columnSchemaSignature]);
 
   useEffect(() => {
-    if (!headerMenu) return;
-    const closeMenu = () => setHeaderMenu(null);
+    const warnOnClose = (event: BeforeUnloadEvent) => {
+      if (!tabs.some((tab) => tab.dirty)) return;
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', warnOnClose);
+    return () => window.removeEventListener('beforeunload', warnOnClose);
+  }, [tabs]);
+
+  useEffect(() => {
+    if (!headerMenu && !rowMenu) return;
+    const closeMenu = () => {
+      setHeaderMenu(null);
+      setRowMenu(null);
+    };
     window.addEventListener('mousedown', closeMenu);
     return () => window.removeEventListener('mousedown', closeMenu);
-  }, [headerMenu]);
+  }, [headerMenu, rowMenu]);
 
   useEffect(() => {
     if (!columnDialog) return;
@@ -304,9 +462,13 @@ export default function App() {
     const appTitle = `Game Data Editor v${version}`;
     const title = csvName ? `${appTitle} - ${csvName}${isDirty ? '*' : ''}` : appTitle;
     window.document.title = title;
-    void getCurrentWindow().setTitle(title).catch(() => {
+    try {
+      void getCurrentWindow().setTitle(title).catch(() => {
+        // The browser-only development preview has no native Tauri window.
+      });
+    } catch {
       // The browser-only development preview has no native Tauri window.
-    });
+    }
   }, [document?.tableName, isDirty]);
 
   const refreshFolderTree = useCallback(async (showLoading = false) => {
@@ -384,29 +546,30 @@ export default function App() {
 
   const openDocument = useCallback(async (
     loader: () => Promise<TableDocument | null>,
-    sourcePath: string | null,
+    requestedPath?: string,
   ) => {
-    if (isDirty && !window.confirm('当前有未保存修改，继续打开其他文件将丢失这些修改。')) return;
+    if (requestedPath) {
+      const existing = [...tabSessions.current.entries()]
+        .find(([, session]) => session.document.sourcePath.toLowerCase() === requestedPath.toLowerCase());
+      if (existing) {
+        await activateTab(existing[0]);
+        return;
+      }
+    }
     setIsBusy(true);
     try {
       const opened = await loader();
       if (!opened) return;
-      replaceDocument(opened, true);
-      setSavedSnapshot(JSON.stringify(opened));
-      setSelectedRows(new Set());
-      setSelectedCells(new Set());
-      setEditingCell(null);
-      setLinkTargetRowIndex(null);
-      setActiveCsvPath(sourcePath);
+      addDocumentTab(opened);
       setNotice(opened.schemaWasMissing ? '未找到 Schema，已按文本列加载；首次保存会生成 Schema。' : '文件已加载。');
     } catch (error) {
       setNotice(`无法打开 CSV：${messageFrom(error)}`);
     } finally {
       setIsBusy(false);
     }
-  }, [isDirty, replaceDocument]);
+  }, [activateTab, addDocumentTab]);
 
-  const openCsv = () => openDocument(() => api.openCsv(), null);
+  const openCsv = () => openDocument(() => api.openCsv());
 
   const openCsvAtPath = (path: string) => openDocument(
     () => api.openCsvAtPath(path),
@@ -459,18 +622,11 @@ export default function App() {
   };
 
   const createCsv = async () => {
-    if (isDirty && !window.confirm('当前有未保存修改，继续新建文件将丢失这些修改。')) return;
     setIsBusy(true);
     try {
       const created = await api.createCsv();
       if (!created) return;
-      replaceDocument(created, true);
-      setSavedSnapshot(JSON.stringify(created));
-      setSelectedRows(new Set());
-      setSelectedCells(new Set());
-      setEditingCell(null);
-      setLinkTargetRowIndex(null);
-      setActiveCsvPath(null);
+      addDocumentTab(created);
       setNotice('已新建 CSV 数据包，请添加列和数据行。');
     } catch (error) {
       setNotice(`无法新建 CSV：${messageFrom(error)}`);
@@ -486,13 +642,21 @@ export default function App() {
     setIsBusy(true);
     try {
       const result = await api.save(documentToSave);
+      issuesRef.current = result.issues;
       setIssues(result.issues);
+      const savingTabId = activeTabIdRef.current;
+      const savingSession = savingTabId ? tabSessions.current.get(savingTabId) : undefined;
+      if (savingSession) savingSession.issues = result.issues;
       if (!result.saved) {
         setNotice(result.message ?? '保存前校验未通过。');
         return;
       }
       replaceDocument(documentToSave);
-      setSavedSnapshot(JSON.stringify(documentToSave));
+      const snapshot = JSON.stringify(documentToSave);
+      savedSnapshotRef.current = snapshot;
+      setSavedSnapshot(snapshot);
+      if (savingSession) savingSession.savedSnapshot = snapshot;
+      if (savingTabId) setTabs((current) => current.map((tab) => tab.id === savingTabId ? { ...tab, dirty: false } : tab));
       setNotice('已安全保存 CSV 与 Schema。');
     } catch (error) {
       setNotice(`保存失败：${messageFrom(error)}`);
@@ -523,13 +687,18 @@ export default function App() {
     }, `cell:${rowIndex}:${columnIndex}`);
   };
 
-  const addRow = () => {
+  const addRowAfter = (rowIndex: number) => {
+    const insertIndex = rowIndex + 1;
     changeDocument((current) => {
       const next = cloneDocument(current);
-      next.rows.push(makeRow(next.schema.columns.length));
+      next.rows.splice(insertIndex, 0, makeRow(next.schema.columns.length));
       return next;
     });
-    setNotice('已新增空行，请填写唯一 id。');
+    setSelectedRows(new Set([insertIndex]));
+    setSelectedCells(new Set());
+    setEditingCell(null);
+    setLinkTargetRowIndex((current) => current !== null && current >= insertIndex ? current + 1 : current);
+    setNotice(`已在第 ${rowIndex + 1} 行后新增空行，请填写唯一 id。`);
   };
 
   const duplicateSelected = async () => {
@@ -564,18 +733,41 @@ export default function App() {
     }
   };
 
-  const deleteSelected = () => {
+  const deleteSelected = async () => {
     if (!document || selectedRows.size === 0) return;
-    if (!window.confirm(`删除选中的 ${selectedRows.size} 行？关联 JSON 会保留为未引用文件，可稍后清理。`)) return;
-    changeDocument((current) => {
-      const next = cloneDocument(current);
-      next.rows = next.rows.filter((_, index) => !selectedRows.has(index));
-      return next;
-    });
-    setSelectedRows(new Set());
-    setSelectedCells(new Set());
-    setEditingCell(null);
-    setNotice('行已删除，关联 JSON 没有自动删除。');
+    const deletedRowCount = selectedRows.size;
+    const jsonColumnIndices = document.schema.columns
+      .map((column, index) => column.type === 'json_ref' ? index : -1)
+      .filter((index) => index >= 0);
+    const deletedReferences = new Set(
+      document.rows
+        .filter((_, index) => selectedRows.has(index))
+        .flatMap((row) => jsonColumnIndices.map((index) => row[index]).filter(Boolean)),
+    );
+    const nextDocument = cloneDocument(document);
+    nextDocument.rows = nextDocument.rows.filter((_, index) => !selectedRows.has(index));
+
+    setIsBusy(true);
+    try {
+      let deletedReferenceCount = 0;
+      if (deletedReferences.size > 0) {
+        const existingOrphans = new Set(await api.listOrphans(nextDocument));
+        const referencesToDelete = [...deletedReferences].filter((reference) => existingOrphans.has(reference));
+        if (referencesToDelete.length > 0) {
+          await api.deleteOrphans(nextDocument, referencesToDelete);
+          deletedReferenceCount = referencesToDelete.length;
+        }
+      }
+      changeDocument(() => nextDocument);
+      setSelectedRows(new Set());
+      setSelectedCells(new Set());
+      setEditingCell(null);
+      setNotice(`已删除 ${deletedRowCount} 行${deletedReferenceCount > 0 ? `及 ${deletedReferenceCount} 个 JSON Ref 文件` : ''}。`);
+    } catch (error) {
+      setNotice(`删除失败：${messageFrom(error)}`);
+    } finally {
+      setIsBusy(false);
+    }
   };
 
   const saveColumnDialog = (name: string, type: ColumnType, linkSheet?: string) => {
@@ -641,7 +833,17 @@ export default function App() {
 
   const openHeaderMenu = (event: React.MouseEvent, index: number) => {
     event.preventDefault();
+    setRowMenu(null);
     setHeaderMenu({ index, x: event.clientX, y: event.clientY });
+  };
+
+  const openRowMenu = (event: React.MouseEvent, rowIndex: number) => {
+    event.preventDefault();
+    if (!selectedRows.has(rowIndex)) setSelectedRows(new Set([rowIndex]));
+    setSelectedCells(new Set());
+    setEditingCell(null);
+    setHeaderMenu(null);
+    setRowMenu({ rowIndex, x: event.clientX, y: event.clientY });
   };
 
   const createReference = async (rowIndex: number, columnIndex: number) => {
@@ -670,16 +872,10 @@ export default function App() {
 
   const openLinkedRow = async (tableName: string, rowId: string) => {
     if (!rowId) return;
-    if (isDirty && !window.confirm('当前有未保存修改，继续跳转将丢失这些修改。')) return;
     setIsBusy(true);
     try {
       const result = await api.openLinkedRow(tableName, rowId);
-      replaceDocument(result.document, true);
-      setSavedSnapshot(JSON.stringify(result.document));
-      setSelectedRows(new Set());
-      setSelectedCells(new Set());
-      setEditingCell(null);
-      setActiveCsvPath(result.path);
+      addDocumentTab(result.document);
       setLinkTargetRowIndex(result.rowIndex);
       setNotice(`已跳转到 ${tableName}.${rowId}。`);
     } catch (error) {
@@ -749,11 +945,6 @@ export default function App() {
 
   const visibleTableRows = dataTable.getRowModel().rows;
   const visibleSourceIndices = visibleTableRows.map((row) => row.original.sourceIndex);
-  const allVisibleRowsSelected = visibleSourceIndices.length > 0
-    && visibleSourceIndices.every((sourceIndex) => selectedRows.has(sourceIndex));
-  const hasActiveFilters = Boolean(dataTable.state.globalFilter)
-    || dataTable.state.columnFilters.length > 0;
-
   const selectCellRange = useCallback((start: CellPosition, end: CellPosition) => {
     const next = new Set<string>();
     const firstRow = Math.min(start.rowPosition, end.rowPosition);
@@ -885,6 +1076,39 @@ export default function App() {
           onToggleAppearance={() => setAppearance((current) => current === 'dark' ? 'light' : 'dark')}
         />
         <section className="editor-content">
+          {tabs.length > 0 && (
+            <div className="sheet-tabs" role="tablist" aria-label="已打开的 Sheet">
+              {tabs.map((tab) => (
+                <div
+                  key={tab.id}
+                  className={`sheet-tab${tab.id === activeTabId ? ' is-active' : ''}`}
+                  role="presentation"
+                >
+                  <button
+                    type="button"
+                    className="sheet-tab-select"
+                    role="tab"
+                    aria-selected={tab.id === activeTabId}
+                    title={tab.path}
+                    disabled={isBusy}
+                    onClick={() => void activateTab(tab.id)}
+                  >
+                    <span>{tab.title}</span>{tab.dirty && <span className="sheet-tab-dirty" aria-label="未保存">•</span>}
+                  </button>
+                  <button
+                    type="button"
+                    className="sheet-tab-close"
+                    aria-label={`关闭 ${tab.title}`}
+                    title={`关闭 ${tab.title}`}
+                    disabled={isBusy}
+                    onClick={() => closeTab(tab.id)}
+                  >
+                    <X size={13} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
           {!document ? (
         <section className="empty-state">
           <div className="empty-icon"><FileSpreadsheet size={42} /></div>
@@ -909,31 +1133,7 @@ export default function App() {
                   <div className="info-banner"><AlertCircle size={16} />未找到同名 Schema；首次保存会创建 <code>{document.tableName}.schema.json</code>。</div>
                 )}
                 <div className="grid-actions">
-                  <button className="button button-secondary" onClick={addRow}><Plus size={16} />新增行</button>
-                  <button className="button button-secondary" onClick={duplicateSelected} disabled={selectedRows.size !== 1 || isBusy}><Copy size={16} />复制行</button>
-                  <button className="button button-danger" onClick={deleteSelected} disabled={selectedRows.size === 0}><Trash2 size={16} />删除行</button>
-                  <button className="button button-secondary" onClick={cleanOrphans} disabled={isBusy}><Trash2 size={16} />清理未引用 JSON</button>
                   <div className="table-tools">
-                    <label className="global-filter">
-                      <Search size={14} />
-                      <input
-                        value={String(dataTable.state.globalFilter ?? '')}
-                        onChange={(event) => dataTable.setGlobalFilter(event.target.value)}
-                        placeholder="搜索全部列"
-                        aria-label="搜索全部列"
-                      />
-                    </label>
-                    <button
-                      type="button"
-                      className="button button-secondary filter-reset"
-                      disabled={!hasActiveFilters}
-                      onClick={() => {
-                        dataTable.resetGlobalFilter(true);
-                        dataTable.resetColumnFilters(true);
-                      }}
-                    >
-                      <FilterX size={14} />清除筛选
-                    </button>
                     <span className="filtered-row-count">显示 {visibleTableRows.length} / {document.rows.length} 行</span>
                   </div>
                 </div>
@@ -942,21 +1142,6 @@ export default function App() {
                     <thead>
                       {dataTable.getHeaderGroups().map((headerGroup) => (
                         <tr key={headerGroup.id}>
-                          <th className="select-column">
-                            <input
-                              type="checkbox"
-                              aria-label="选择当前筛选结果中的全部行"
-                              checked={allVisibleRowsSelected}
-                              onChange={(event) => {
-                                const checked = event.target.checked;
-                                setSelectedRows((current) => {
-                                  const next = new Set(current);
-                                  visibleSourceIndices.forEach((sourceIndex) => checked ? next.add(sourceIndex) : next.delete(sourceIndex));
-                                  return next;
-                                });
-                              }}
-                            />
-                          </th>
                           <th className="index-column" title="CSV 中的原始行号">#</th>
                           {headerGroup.headers.map((header, columnIndex) => {
                             const column = document.schema.columns[columnIndex];
@@ -1003,12 +1188,12 @@ export default function App() {
                           <tr
                             key={tableRow.id}
                             data-row-index={rowIndex}
+                            onContextMenu={(event) => openRowMenu(event, rowIndex)}
                             className={[
                               selectedRows.has(rowIndex) ? 'is-selected' : '',
                               linkTargetRowIndex === rowIndex ? 'is-link-target' : '',
                             ].filter(Boolean).join(' ')}
                           >
-                            <td className="select-column"><input type="checkbox" aria-label={`选择原始第 ${rowIndex + 1} 行`} checked={selectedRows.has(rowIndex)} onChange={() => setSelectedRows((current) => { const next = new Set(current); next.has(rowIndex) ? next.delete(rowIndex) : next.add(rowIndex); return next; })} /></td>
                             <td className="index-column">{rowIndex + 1}</td>
                             {document.schema.columns.map((column, columnIndex) => {
                               const key = cellKey(rowIndex, columnIndex);
@@ -1079,7 +1264,7 @@ export default function App() {
                         );
                       })}
                       {visibleTableRows.length === 0 && (
-                        <tr><td className="no-filter-results" colSpan={document.schema.columns.length + 2}>没有符合当前筛选条件的数据</td></tr>
+                        <tr><td className="no-filter-results" colSpan={document.schema.columns.length + 1}>没有符合当前筛选条件的数据</td></tr>
                       )}
                     </tbody>
                   </table>
@@ -1099,6 +1284,17 @@ export default function App() {
           onDelete={() => { deleteColumn(headerMenu.index); setHeaderMenu(null); }}
           onMoveRight={() => { moveColumn(headerMenu.index, 1); setHeaderMenu(null); }}
           onAddRight={() => { setColumnDialog({ mode: 'add', index: headerMenu.index + 1 }); setHeaderMenu(null); }}
+        />
+      )}
+      {document && rowMenu && (
+        <RowContextMenu
+          selectionCount={selectedRows.has(rowMenu.rowIndex) ? selectedRows.size : 1}
+          disabled={isBusy}
+          style={{ left: Math.min(rowMenu.x, window.innerWidth - 220), top: Math.min(rowMenu.y, window.innerHeight - 190) }}
+          onAdd={() => { const rowIndex = rowMenu.rowIndex; setRowMenu(null); addRowAfter(rowIndex); }}
+          onDuplicate={() => { setRowMenu(null); void duplicateSelected(); }}
+          onDelete={() => { setRowMenu(null); void deleteSelected(); }}
+          onCleanOrphans={() => { setRowMenu(null); void cleanOrphans(); }}
         />
       )}
       {document && columnDialog && (
@@ -1509,6 +1705,25 @@ function HeaderContextMenu({ column, isId, canMoveRight, style, onEdit, onDelete
     <button className="menu-item" onClick={onAddRight}>在右侧新增一列</button>
     <div className="menu-divider" />
     <button className="menu-item menu-item-danger" disabled={isId} onClick={onDelete}>删除列</button>
+  </div>;
+}
+
+function RowContextMenu({ selectionCount, disabled, style, onAdd, onDuplicate, onDelete, onCleanOrphans }: {
+  selectionCount: number;
+  disabled: boolean;
+  style: React.CSSProperties;
+  onAdd: () => void;
+  onDuplicate: () => void;
+  onDelete: () => void;
+  onCleanOrphans: () => void;
+}) {
+  return <div className="row-context-menu" style={style} onMouseDown={(event) => event.stopPropagation()}>
+    <div className="menu-heading">{selectionCount > 1 ? `已选择 ${selectionCount} 行` : '当前行'}</div>
+    <button className="menu-item" disabled={disabled} onClick={onAdd}><Plus size={14} />新增行</button>
+    <button className="menu-item" disabled={disabled || selectionCount !== 1} onClick={onDuplicate}><Copy size={14} />复制行</button>
+    <button className="menu-item menu-item-danger" disabled={disabled || selectionCount === 0} onClick={onDelete}><Trash2 size={14} />删除行</button>
+    <div className="menu-divider" />
+    <button className="menu-item" disabled={disabled} onClick={onCleanOrphans}><Trash2 size={14} />清理未引用 JSON</button>
   </div>;
 }
 
