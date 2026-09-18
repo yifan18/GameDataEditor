@@ -53,3 +53,8 @@ $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
 cargo check --manifest-path src-tauri\Cargo.toml
 cargo test --manifest-path src-tauri\Cargo.toml
 ```
+
+## 构建
+```powershell
+npm run tauri build
+```

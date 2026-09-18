@@ -36,7 +36,9 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
+import { version } from '../package.json';
 import { api } from './lib/api';
+import { encodeClipboardCell, parseClipboardText } from './lib/clipboard';
 import type {
   ColumnSchema,
   ColumnType,
@@ -105,6 +107,14 @@ interface ColumnDialogState {
   index: number;
 }
 
+interface CellPosition {
+  rowPosition: number;
+  columnIndex: number;
+}
+
+const cellKey = (rowIndex: number, columnIndex: number) => `${rowIndex}:${columnIndex}`;
+const undoHistoryLimit = 100;
+
 type AppAppearance = 'light' | 'dark';
 
 function initialAppearance(): AppAppearance {
@@ -123,10 +133,12 @@ function cloneDocument(document: TableDocument): TableDocument {
 
 export default function App() {
   const [appearance, setAppearance] = useState<AppAppearance>(initialAppearance);
-  const [document, setDocument] = useState<TableDocument | null>(null);
+  const [document, setDocumentState] = useState<TableDocument | null>(null);
   const [savedSnapshot, setSavedSnapshot] = useState('');
   const [issues, setIssues] = useState<ValidationIssue[]>([]);
   const [selectedRows, setSelectedRows] = useState<Set<number>>(new Set());
+  const [selectedCells, setSelectedCells] = useState<Set<string>>(new Set());
+  const [editingCell, setEditingCell] = useState<string | null>(null);
   const [folderRoots, setFolderRoots] = useState<FolderTreeRoot[]>([]);
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
   const [activeCsvPath, setActiveCsvPath] = useState<string | null>(null);
@@ -137,7 +149,49 @@ export default function App() {
   const [headerMenu, setHeaderMenu] = useState<HeaderMenuState | null>(null);
   const [columnDialog, setColumnDialog] = useState<ColumnDialogState | null>(null);
   const fileMenuActions = useRef<Record<string, () => void>>({});
+  const saveInProgress = useRef(false);
   const knownFolderRoots = useRef(new Set<string>());
+  const dragSelectionStart = useRef<CellPosition | null>(null);
+  const documentRef = useRef<TableDocument | null>(null);
+  const undoHistory = useRef<TableDocument[]>([]);
+  const activeHistoryGroup = useRef<string | null>(null);
+
+  const replaceDocument = useCallback((next: TableDocument, clearUndoHistory = false) => {
+    if (clearUndoHistory) undoHistory.current = [];
+    activeHistoryGroup.current = null;
+    documentRef.current = next;
+    setDocumentState(next);
+  }, []);
+
+  const changeDocument = useCallback((
+    updater: (current: TableDocument) => TableDocument,
+    historyGroup?: string,
+  ) => {
+    const current = documentRef.current;
+    if (!current) return;
+    const next = updater(current);
+    if (next === current) return;
+
+    if (!historyGroup || activeHistoryGroup.current !== historyGroup) {
+      if (undoHistory.current.length >= undoHistoryLimit) undoHistory.current.shift();
+      undoHistory.current.push(cloneDocument(current));
+    }
+    activeHistoryGroup.current = historyGroup ?? null;
+    documentRef.current = next;
+    setDocumentState(next);
+  }, []);
+
+  const undoDocument = useCallback(() => {
+    const previous = undoHistory.current.pop();
+    if (!previous) return;
+    activeHistoryGroup.current = null;
+    documentRef.current = previous;
+    setDocumentState(previous);
+    setSelectedRows(new Set());
+    setSelectedCells(new Set());
+    setEditingCell(null);
+    setNotice('已撤销上一步修改。');
+  }, []);
 
   const isDirty = document !== null && JSON.stringify(document) !== savedSnapshot;
 
@@ -220,12 +274,13 @@ export default function App() {
 
   useEffect(() => {
     const csvName = document ? `${document.tableName}.csv` : null;
-    const title = csvName ? `${csvName} — Game Data Editor` : 'Game Data Editor';
+    const appTitle = `Game Data Editor v${version}`;
+    const title = csvName ? `${appTitle} - ${csvName}${isDirty ? '*' : ''}` : appTitle;
     window.document.title = title;
     void getCurrentWindow().setTitle(title).catch(() => {
       // The browser-only development preview has no native Tauri window.
     });
-  }, [document?.tableName]);
+  }, [document?.tableName, isDirty]);
 
   const refreshFolderTree = useCallback(async (showLoading = false) => {
     if (showLoading) setIsFolderTreeLoading(true);
@@ -309,9 +364,11 @@ export default function App() {
     try {
       const opened = await loader();
       if (!opened) return;
-      setDocument(opened);
+      replaceDocument(opened, true);
       setSavedSnapshot(JSON.stringify(opened));
       setSelectedRows(new Set());
+      setSelectedCells(new Set());
+      setEditingCell(null);
       setActiveCsvPath(sourcePath);
       setNotice(opened.schemaWasMissing ? '未找到 Schema，已按文本列加载；首次保存会生成 Schema。' : '文件已加载。');
     } catch (error) {
@@ -319,7 +376,7 @@ export default function App() {
     } finally {
       setIsBusy(false);
     }
-  }, [isDirty]);
+  }, [isDirty, replaceDocument]);
 
   const openCsv = () => openDocument(() => api.openCsv(), null);
 
@@ -379,9 +436,11 @@ export default function App() {
     try {
       const created = await api.createCsv();
       if (!created) return;
-      setDocument(created);
+      replaceDocument(created, true);
       setSavedSnapshot(JSON.stringify(created));
       setSelectedRows(new Set());
+      setSelectedCells(new Set());
+      setEditingCell(null);
       setActiveCsvPath(null);
       setNotice('已新建 CSV 数据包，请添加列和数据行。');
     } catch (error) {
@@ -392,7 +451,8 @@ export default function App() {
   };
 
   const save = useCallback(async () => {
-    if (!document || isBusy) return;
+    if (!document || isBusy || saveInProgress.current) return;
+    saveInProgress.current = true;
     const documentToSave = { ...document, schemaWasMissing: false };
     setIsBusy(true);
     try {
@@ -402,15 +462,16 @@ export default function App() {
         setNotice(result.message ?? '保存前校验未通过。');
         return;
       }
-      setDocument(documentToSave);
+      replaceDocument(documentToSave);
       setSavedSnapshot(JSON.stringify(documentToSave));
       setNotice('已安全保存 CSV 与 Schema。');
     } catch (error) {
       setNotice(`保存失败：${messageFrom(error)}`);
     } finally {
+      saveInProgress.current = false;
       setIsBusy(false);
     }
-  }, [document, isBusy]);
+  }, [document, isBusy, replaceDocument]);
 
   const exportPackage = async () => {
     if (!document) return;
@@ -426,17 +487,15 @@ export default function App() {
   };
 
   const updateCell = (rowIndex: number, columnIndex: number, value: string) => {
-    setDocument((current) => {
-      if (!current) return current;
+    changeDocument((current) => {
       const next = cloneDocument(current);
       next.rows[rowIndex][columnIndex] = value;
       return next;
-    });
+    }, `cell:${rowIndex}:${columnIndex}`);
   };
 
   const addRow = () => {
-    setDocument((current) => {
-      if (!current) return current;
+    changeDocument((current) => {
       const next = cloneDocument(current);
       next.rows.push(makeRow(next.schema.columns.length));
       return next;
@@ -460,13 +519,14 @@ export default function App() {
         }
       }
       copy[0] = '';
-      setDocument((current) => {
-        if (!current) return current;
+      changeDocument((current) => {
         const next = cloneDocument(current);
         next.rows.splice(rowIndex + 1, 0, copy);
         return next;
       });
       setSelectedRows(new Set([rowIndex + 1]));
+      setSelectedCells(new Set());
+      setEditingCell(null);
       setNotice('已复制该行及其 JSON 引用；请填写新的 id。');
     } catch (error) {
       setNotice(`复制失败：${messageFrom(error)}`);
@@ -478,13 +538,14 @@ export default function App() {
   const deleteSelected = () => {
     if (!document || selectedRows.size === 0) return;
     if (!window.confirm(`删除选中的 ${selectedRows.size} 行？关联 JSON 会保留为未引用文件，可稍后清理。`)) return;
-    setDocument((current) => {
-      if (!current) return current;
+    changeDocument((current) => {
       const next = cloneDocument(current);
       next.rows = next.rows.filter((_, index) => !selectedRows.has(index));
       return next;
     });
     setSelectedRows(new Set());
+    setSelectedCells(new Set());
+    setEditingCell(null);
     setNotice('行已删除，关联 JSON 没有自动删除。');
   };
 
@@ -495,8 +556,7 @@ export default function App() {
       setNotice('列名不能为空且不能重复。');
       return;
     }
-    setDocument((current) => {
-      if (!current) return current;
+    changeDocument((current) => {
       const next = cloneDocument(current);
       if (columnDialog.mode === 'edit') {
         if (columnDialog.index === 0) return current;
@@ -507,33 +567,39 @@ export default function App() {
       }
       return next;
     });
+    if (columnDialog.mode === 'add') {
+      setSelectedCells(new Set());
+      setEditingCell(null);
+    }
     setNotice(columnDialog.mode === 'edit' ? `已更新 ${trimmed} 列。` : `已在右侧新增 ${trimmed} 列。`);
     setColumnDialog(null);
   };
 
   const moveColumn = (index: number, direction: -1 | 1) => {
     if (!document || index === 0 || index + direction <= 0 || index + direction >= document.schema.columns.length) return;
-    setDocument((current) => {
-      if (!current) return current;
+    changeDocument((current) => {
       const next = cloneDocument(current);
       const target = index + direction;
       [next.schema.columns[index], next.schema.columns[target]] = [next.schema.columns[target], next.schema.columns[index]];
       next.rows.forEach((row) => ([row[index], row[target]] = [row[target], row[index]]));
       return next;
     });
+    setSelectedCells(new Set());
+    setEditingCell(null);
   };
 
   const deleteColumn = (index: number) => {
     if (!document || index === 0) return;
     const column = document.schema.columns[index];
     if (!window.confirm(`删除 “${column.name}” 列？${column.type === 'json_ref' ? '关联 JSON 会保留为未引用文件。' : ''}`)) return;
-    setDocument((current) => {
-      if (!current) return current;
+    changeDocument((current) => {
       const next = cloneDocument(current);
       next.schema.columns.splice(index, 1);
       next.rows.forEach((row) => row.splice(index, 1));
       return next;
     });
+    setSelectedCells(new Set());
+    setEditingCell(null);
     setNotice(`已删除 ${column.name} 列。`);
   };
 
@@ -608,12 +674,132 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
+      const key = event.key.toLowerCase();
+      if (key === 's') {
+        event.preventDefault();
+        fileMenuActions.current['file-save']?.();
+      } else if (key === 'z' && !event.shiftKey) {
+        event.preventDefault();
+        if (!event.repeat && !isBusy) undoDocument();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isBusy, undoDocument]);
+
   const visibleTableRows = dataTable.getRowModel().rows;
   const visibleSourceIndices = visibleTableRows.map((row) => row.original.sourceIndex);
   const allVisibleRowsSelected = visibleSourceIndices.length > 0
     && visibleSourceIndices.every((sourceIndex) => selectedRows.has(sourceIndex));
   const hasActiveFilters = Boolean(dataTable.state.globalFilter)
     || dataTable.state.columnFilters.length > 0;
+
+  const selectCellRange = useCallback((start: CellPosition, end: CellPosition) => {
+    const next = new Set<string>();
+    const firstRow = Math.min(start.rowPosition, end.rowPosition);
+    const lastRow = Math.max(start.rowPosition, end.rowPosition);
+    const firstColumn = Math.min(start.columnIndex, end.columnIndex);
+    const lastColumn = Math.max(start.columnIndex, end.columnIndex);
+    for (let rowPosition = firstRow; rowPosition <= lastRow; rowPosition += 1) {
+      const rowIndex = visibleSourceIndices[rowPosition];
+      if (rowIndex === undefined) continue;
+      for (let columnIndex = firstColumn; columnIndex <= lastColumn; columnIndex += 1) {
+        next.add(cellKey(rowIndex, columnIndex));
+      }
+    }
+    setSelectedCells(next);
+  }, [visibleSourceIndices]);
+
+  const beginCellSelection = (event: React.MouseEvent, rowPosition: number, columnIndex: number) => {
+    if (event.button !== 0) return;
+    const key = cellKey(visibleSourceIndices[rowPosition], columnIndex);
+    const interactiveTarget = (event.target as HTMLElement).closest('input, textarea, select, button');
+    if (interactiveTarget && (editingCell === key || interactiveTarget.tagName === 'BUTTON')) return;
+    event.preventDefault();
+    activeHistoryGroup.current = null;
+    setEditingCell(null);
+    const start = { rowPosition, columnIndex };
+    dragSelectionStart.current = start;
+    selectCellRange(start, start);
+  };
+
+  const extendCellSelection = (rowPosition: number, columnIndex: number) => {
+    if (!dragSelectionStart.current) return;
+    selectCellRange(dragSelectionStart.current, { rowPosition, columnIndex });
+  };
+
+  useEffect(() => {
+    const finishSelection = () => { dragSelectionStart.current = null; };
+    window.addEventListener('mouseup', finishSelection);
+    window.addEventListener('blur', finishSelection);
+    return () => {
+      window.removeEventListener('mouseup', finishSelection);
+      window.removeEventListener('blur', finishSelection);
+    };
+  }, []);
+
+  useEffect(() => {
+    const handleCopy = (event: ClipboardEvent) => {
+      if (!document || editingCell || selectedCells.size === 0) return;
+
+      const visiblePositionBySource = new Map(visibleSourceIndices.map((sourceIndex, position) => [sourceIndex, position]));
+      const selected = [...selectedCells].map((key) => {
+        const [rowIndex, columnIndex] = key.split(':').map(Number);
+        return { rowIndex, columnIndex, rowPosition: visiblePositionBySource.get(rowIndex) ?? rowIndex };
+      });
+      const rows = [...new Set(selected.map((cell) => cell.rowPosition))].sort((left, right) => left - right);
+      const columns = [...new Set(selected.map((cell) => cell.columnIndex))].sort((left, right) => left - right);
+      const sourceByPosition = new Map(selected.map((cell) => [cell.rowPosition, cell.rowIndex]));
+      const copiedText = rows.map((rowPosition) => {
+        const rowIndex = sourceByPosition.get(rowPosition);
+        return columns.map((columnIndex) => encodeClipboardCell(
+          rowIndex === undefined ? '' : document.rows[rowIndex]?.[columnIndex] ?? '',
+        )).join('\t');
+      }).join('\n');
+
+      event.preventDefault();
+      event.clipboardData?.setData('text/plain', copiedText);
+      setNotice(`已复制 ${selectedCells.size} 个单元格。`);
+    };
+
+    window.addEventListener('copy', handleCopy);
+    return () => window.removeEventListener('copy', handleCopy);
+  }, [document, editingCell, selectedCells, visibleSourceIndices]);
+
+  useEffect(() => {
+    const handlePaste = (event: ClipboardEvent) => {
+      if (!document || editingCell || selectedCells.size === 0) return;
+      const clipboardText = event.clipboardData?.getData('text/plain');
+      if (clipboardText === undefined) return;
+      event.preventDefault();
+
+      const clipboardRows = parseClipboardText(clipboardText);
+      const visiblePositionBySource = new Map(visibleSourceIndices.map((sourceIndex, position) => [sourceIndex, position]));
+      const selected = [...selectedCells].map((key) => {
+        const [rowIndex, columnIndex] = key.split(':').map(Number);
+        return { rowIndex, columnIndex, rowPosition: visiblePositionBySource.get(rowIndex) ?? rowIndex };
+      });
+      const firstRow = Math.min(...selected.map((cell) => cell.rowPosition));
+      const firstColumn = Math.min(...selected.map((cell) => cell.columnIndex));
+
+      changeDocument((current) => {
+        const next = cloneDocument(current);
+        selected.forEach(({ rowIndex, columnIndex, rowPosition }) => {
+          const clipboardRow = clipboardRows[(rowPosition - firstRow) % clipboardRows.length];
+          const value = clipboardRow[(columnIndex - firstColumn) % clipboardRow.length] ?? '';
+          if (next.rows[rowIndex]?.[columnIndex] !== undefined) next.rows[rowIndex][columnIndex] = value;
+        });
+        return next;
+      });
+      setNotice(`已粘贴到 ${selectedCells.size} 个单元格。`);
+    };
+
+    window.addEventListener('paste', handlePaste);
+    return () => window.removeEventListener('paste', handlePaste);
+  }, [document, editingCell, selectedCells, visibleSourceIndices]);
 
   return (
     <Theme
@@ -753,25 +939,58 @@ export default function App() {
                       ))}
                     </thead>
                     <tbody>
-                      {visibleTableRows.map((tableRow) => {
+                      {visibleTableRows.map((tableRow, rowPosition) => {
                         const rowIndex = tableRow.original.sourceIndex;
                         const row = tableRow.original.values;
                         return (
                           <tr key={tableRow.id} className={selectedRows.has(rowIndex) ? 'is-selected' : ''}>
                             <td className="select-column"><input type="checkbox" aria-label={`选择原始第 ${rowIndex + 1} 行`} checked={selectedRows.has(rowIndex)} onChange={() => setSelectedRows((current) => { const next = new Set(current); next.has(rowIndex) ? next.delete(rowIndex) : next.add(rowIndex); return next; })} /></td>
                             <td className="index-column">{rowIndex + 1}</td>
-                            {document.schema.columns.map((column, columnIndex) => (
-                              <td key={`${rowIndex}-${column.name}`} className={issueByCell.has(`${rowIndex}:${column.name}`) ? 'has-error' : ''} title={issueByCell.get(`${rowIndex}:${column.name}`)?.map((issue) => issue.message).join('\n')}>
-                                <CellEditor
-                                  column={column}
-                                  value={row[columnIndex] ?? ''}
-                                  onChange={(value) => updateCell(rowIndex, columnIndex, value)}
-                                  onCreateReference={() => createReference(rowIndex, columnIndex)}
-                                  onOpenReference={() => openReference(row[columnIndex])}
-                                  disabled={isBusy}
-                                />
-                              </td>
-                            ))}
+                            {document.schema.columns.map((column, columnIndex) => {
+                              const key = cellKey(rowIndex, columnIndex);
+                              const isEditing = editingCell === key;
+                              const classNames = [
+                                issueByCell.has(`${rowIndex}:${column.name}`) ? 'has-error' : '',
+                                selectedCells.has(key) ? 'is-cell-selected' : '',
+                                isEditing ? 'is-cell-editing' : '',
+                              ].filter(Boolean).join(' ');
+                              return (
+                                <td
+                                  key={`${rowIndex}-${column.name}`}
+                                  className={classNames}
+                                  title={issueByCell.get(`${rowIndex}:${column.name}`)?.map((issue) => issue.message).join('\n')}
+                                  onMouseDown={(event) => beginCellSelection(event, rowPosition, columnIndex)}
+                                  onMouseEnter={() => extendCellSelection(rowPosition, columnIndex)}
+                                  onDoubleClick={(event) => {
+                                    event.preventDefault();
+                                    setSelectedCells(new Set([key]));
+                                    if (column.type !== 'json_ref') setEditingCell(key);
+                                  }}
+                                  onBlur={(event) => {
+                                    if (isEditing && !event.currentTarget.contains(event.relatedTarget as Node | null)) {
+                                      activeHistoryGroup.current = null;
+                                      setEditingCell(null);
+                                    }
+                                  }}
+                                >
+                                  {isEditing || column.type === 'json_ref' ? (
+                                    <CellEditor
+                                      column={column}
+                                      value={row[columnIndex] ?? ''}
+                                      onChange={(value) => updateCell(rowIndex, columnIndex, value)}
+                                      onCreateReference={() => createReference(rowIndex, columnIndex)}
+                                      onOpenReference={() => openReference(row[columnIndex])}
+                                      disabled={isBusy}
+                                      autoFocus
+                                    />
+                                  ) : (
+                                    <div className={`cell-value${row[columnIndex] ? '' : ' is-empty'}`}>
+                                      {row[columnIndex] || ''}
+                                    </div>
+                                  )}
+                                </td>
+                              );
+                            })}
                           </tr>
                         );
                       })}
@@ -1066,34 +1285,35 @@ function TreeError({ message, depth }: { message: string; depth: number }) {
   </div>;
 }
 
-function CellEditor({ column, value, onChange, onCreateReference, onOpenReference, disabled }: {
+function CellEditor({ column, value, onChange, onCreateReference, onOpenReference, disabled, autoFocus = false }: {
   column: ColumnSchema;
   value: string;
   onChange: (value: string) => void;
   onCreateReference: () => void;
   onOpenReference: () => void;
   disabled: boolean;
+  autoFocus?: boolean;
 }) {
   if (column.type === 'json_ref') {
     return value ? (
       <div className="json-ref-cell">
-        <button className="json-open" onClick={onOpenReference} disabled={disabled} title={value}><FileJson size={15} />打开 JSON</button>
+        <button className="json-open" onClick={onOpenReference} disabled={disabled} title={value} autoFocus={autoFocus}><FileJson size={15} />打开 JSON</button>
         <button className="icon-button" onClick={() => onChange('')} disabled={disabled} aria-label="清空 JSON 引用"><X size={14} /></button>
       </div>
-    ) : <button className="json-create" onClick={onCreateReference} disabled={disabled}><Plus size={14} />新建 JSON</button>;
+    ) : <button className="json-create" onClick={onCreateReference} disabled={disabled} autoFocus={autoFocus}><Plus size={14} />新建 JSON</button>;
   }
   if (column.type === 'bool') {
-    return <select className="cell-input" value={value} onChange={(event) => onChange(event.target.value)}>
+    return <select className="cell-input" value={value} onChange={(event) => onChange(event.target.value)} autoFocus={autoFocus}>
       <option value="">—</option><option value="true">true</option><option value="false">false</option>
     </select>;
   }
   if (column.type === 'string') {
-    return <TextCellEditor value={value} onChange={onChange} />;
+    return <TextCellEditor value={value} onChange={onChange} autoFocus={autoFocus} />;
   }
-  return <input className="cell-input" value={value} onChange={(event) => onChange(event.target.value)} onFocus={(event) => event.currentTarget.select()} inputMode={column.type === 'int' || column.type === 'float' || column.type === 'vector2int' ? 'decimal' : 'text'} />;
+  return <input className="cell-input" value={value} onChange={(event) => onChange(event.target.value)} onFocus={(event) => event.currentTarget.select()} inputMode={column.type === 'int' || column.type === 'float' || column.type === 'vector2int' ? 'decimal' : 'text'} autoFocus={autoFocus} />;
 }
 
-function TextCellEditor({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+function TextCellEditor({ value, onChange, autoFocus }: { value: string; onChange: (value: string) => void; autoFocus: boolean }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const fitHeight = useCallback(() => {
@@ -1130,6 +1350,7 @@ function TextCellEditor({ value, onChange }: { value: string; onChange: (value: 
     rows={1}
     wrap="soft"
     value={value}
+    autoFocus={autoFocus}
     onChange={(event) => onChange(event.currentTarget.value)}
     onFocus={(event) => event.currentTarget.select()}
   />;
