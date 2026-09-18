@@ -94,17 +94,17 @@ input[type="checkbox"] { accent-color: var(--gray-12); }
 .data-grid tr.is-link-target td { background: var(--accent-3); box-shadow: inset 0 2px var(--accent-8), inset 0 -2px var(--accent-8); }
 .data-grid tr.is-link-target td:first-child { box-shadow: inset 2px 0 var(--accent-8), inset 0 2px var(--accent-8), inset 0 -2px var(--accent-8); }
 .data-grid tr.is-link-target td:last-child { box-shadow: inset -2px 0 var(--accent-8), inset 0 2px var(--accent-8), inset 0 -2px var(--accent-8); }
-.data-grid td.is-cell-selected { position: relative; background: var(--gray-4); box-shadow: inset 0 0 0 2px var(--gray-10); }
-.data-grid tr:hover td.is-cell-selected, .data-grid tr.is-selected td.is-cell-selected { background: var(--gray-4); }
-.data-grid td.is-cell-editing { box-shadow: inset 0 0 0 2px var(--gray-11); }
+.data-grid td.is-cell-selected { position: relative; background: #9ce4ff; box-shadow: none; }
+.data-grid tr:hover td.is-cell-selected, .data-grid tr.is-selected td.is-cell-selected { background: #9ce4ff; }
+.data-grid td.is-cell-editing { box-shadow: none; }
 .data-grid td.has-error { box-shadow: inset 0 -2px var(--red-9); }
-.data-grid td.has-error.is-cell-selected { box-shadow: inset 0 0 0 2px var(--gray-10), inset 0 -3px var(--red-9); }
+.data-grid td.has-error.is-cell-selected { box-shadow: inset 0 -3px var(--red-9); }
 .data-grid td.no-filter-results { height: 96px; color: var(--gray-10); text-align: center; background: var(--color-panel-solid); }
 .index-column { width: 38px; min-width: 38px !important; text-align: center !important; color: var(--gray-10) !important; }
-.cell-input { width: 100%; min-width: 108px; height: 27px; padding: 0 6px; color: var(--gray-12); outline: none; border: 1px solid transparent; border-radius: var(--radius-1); background: transparent; }
+.cell-input { width: 100%; min-width: 108px; height: 27px; padding: 0 6px; color: var(--gray-12); outline: none; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
 .cell-value { min-width: 108px; min-height: 27px; padding: 4px 6px; line-height: 18px; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; user-select: none; cursor: default; }
 .cell-value.is-empty::after { content: '\00a0'; }
-.cell-input:focus { border-color: var(--gray-9); background: var(--color-background); box-shadow: 0 0 0 2px var(--gray-a4); }
+.cell-input:focus { outline: none; border: 0; background: transparent; box-shadow: none; }
 .cell-textarea { display: block; min-width: 0; height: 27px; min-height: 27px; max-width: 100%; padding: 4px 6px; line-height: 18px; overflow: hidden; resize: none; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
 .json-ref-cell { gap: 4px; justify-content: space-between; }
 .json-open, .json-create { height: 26px; padding: 0 7px; display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--gray-7); border-radius: var(--radius-1); color: var(--gray-12); background: var(--gray-3); font-size: 11px; font-weight: 600; white-space: nowrap; }
