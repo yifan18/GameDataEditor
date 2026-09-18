@@ -85,6 +85,9 @@ input[type="checkbox"] { accent-color: var(--gray-12); }
 .data-grid td { height: 35px; padding: 3px 4px; border-bottom: 1px solid var(--gray-5); border-right: 1px solid var(--gray-5); background: var(--color-panel-solid); }
 .data-grid tr:hover td { background: var(--gray-2); }
 .data-grid tr.is-selected td { background: var(--gray-3); }
+.data-grid tr.is-link-target td { background: var(--accent-3); box-shadow: inset 0 2px var(--accent-8), inset 0 -2px var(--accent-8); }
+.data-grid tr.is-link-target td:first-child { box-shadow: inset 2px 0 var(--accent-8), inset 0 2px var(--accent-8), inset 0 -2px var(--accent-8); }
+.data-grid tr.is-link-target td:last-child { box-shadow: inset -2px 0 var(--accent-8), inset 0 2px var(--accent-8), inset 0 -2px var(--accent-8); }
 .data-grid td.is-cell-selected { position: relative; background: var(--gray-4); box-shadow: inset 0 0 0 2px var(--gray-10); }
 .data-grid tr:hover td.is-cell-selected, .data-grid tr.is-selected td.is-cell-selected { background: var(--gray-4); }
 .data-grid td.is-cell-editing { box-shadow: inset 0 0 0 2px var(--gray-11); }
@@ -100,6 +103,15 @@ input[type="checkbox"] { accent-color: var(--gray-12); }
 .json-ref-cell { gap: 4px; justify-content: space-between; }
 .json-open, .json-create { height: 26px; padding: 0 7px; display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--gray-7); border-radius: var(--radius-1); color: var(--gray-12); background: var(--gray-3); font-size: 11px; font-weight: 600; white-space: nowrap; }
 .json-open:hover:not(:disabled), .json-create:hover:not(:disabled) { background: var(--gray-4); border-color: var(--gray-8); }
+.link-tags { min-width: 220px; min-height: 31px; padding: 3px; display: flex; align-items: center; gap: 5px; flex-wrap: wrap; border: 1px solid var(--gray-7); border-radius: var(--radius-2); background: var(--color-surface); }
+.link-tags:focus-within { border-color: var(--gray-10); box-shadow: 0 0 0 2px var(--gray-a4); }
+.link-tag { max-width: 100%; height: 25px; display: inline-flex; align-items: center; overflow: hidden; border-radius: var(--radius-2); background: var(--cyan-9, #0891b2); }
+.link-tag-label, .link-tag-remove { height: 100%; padding: 0; border: 0; color: white; background: transparent; }
+.link-tag-label { min-width: 0; padding-left: 9px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-weight: 600; }
+.link-tag-remove { width: 27px; flex: 0 0 27px; display: inline-grid; place-items: center; }
+.link-tag-label:hover:not(:disabled), .link-tag-remove:hover:not(:disabled) { background: rgba(255, 255, 255, .15); }
+.link-tags-input { min-width: 160px; height: 25px; padding: 0 6px; flex: 1; border: 0; color: var(--gray-12); outline: 0; background: transparent; font-size: 11px; }
+.link-tags-input::placeholder { color: var(--gray-8); }
 .icon-button { width: 26px; height: 26px; display: inline-grid; place-items: center; border: 1px solid transparent; border-radius: var(--radius-1); color: var(--gray-11); background: transparent; }
 .danger-icon:hover:not(:disabled) { color: var(--red-11); background: var(--red-3); }
 
@@ -127,6 +139,9 @@ input[type="checkbox"] { accent-color: var(--gray-12); }
 .column-dialog label { display: grid; gap: 6px; margin-top: 10px; color: var(--gray-11); font-size: 11px; }
 .column-dialog input, .column-dialog select { height: 31px; padding: 0 8px; border: 1px solid var(--gray-7); border-radius: var(--radius-2); color: var(--gray-12); outline: none; background: var(--color-surface); }
 .column-dialog input:focus, .column-dialog select:focus { border-color: var(--gray-10); box-shadow: 0 0 0 2px var(--gray-a4); }
+.column-dialog .link-option { display: flex; grid-template-columns: none; align-items: center; gap: 7px; }
+.column-dialog .link-option input { width: 15px; height: 15px; margin: 0; padding: 0; }
+.column-dialog .link-option.is-disabled { color: var(--gray-9); }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: 18px; }
 
 @keyframes spin { to { transform: rotate(360deg); } }

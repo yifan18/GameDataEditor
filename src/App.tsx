@@ -148,6 +148,8 @@ export default function App() {
   const [isFolderActionBusy, setIsFolderActionBusy] = useState(false);
   const [headerMenu, setHeaderMenu] = useState<HeaderMenuState | null>(null);
   const [columnDialog, setColumnDialog] = useState<ColumnDialogState | null>(null);
+  const [siblingSheets, setSiblingSheets] = useState<string[]>([]);
+  const [linkTargetRowIndex, setLinkTargetRowIndex] = useState<number | null>(null);
   const fileMenuActions = useRef<Record<string, () => void>>({});
   const saveInProgress = useRef(false);
   const knownFolderRoots = useRef(new Set<string>());
@@ -273,6 +275,31 @@ export default function App() {
   }, [headerMenu]);
 
   useEffect(() => {
+    if (!columnDialog) return;
+    let active = true;
+    void api.listSiblingSheets()
+      .then((sheets) => { if (active) setSiblingSheets(sheets); })
+      .catch((error) => {
+        if (active) {
+          setSiblingSheets([]);
+          setNotice(`无法读取同目录 Sheet：${messageFrom(error)}`);
+        }
+      });
+    return () => { active = false; };
+  }, [columnDialog]);
+
+  useEffect(() => {
+    if (linkTargetRowIndex === null) return;
+    const frame = window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        window.document.querySelector(`[data-row-index="${linkTargetRowIndex}"]`)
+          ?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [document?.tableName, linkTargetRowIndex]);
+
+  useEffect(() => {
     const csvName = document ? `${document.tableName}.csv` : null;
     const appTitle = `Game Data Editor v${version}`;
     const title = csvName ? `${appTitle} - ${csvName}${isDirty ? '*' : ''}` : appTitle;
@@ -369,6 +396,7 @@ export default function App() {
       setSelectedRows(new Set());
       setSelectedCells(new Set());
       setEditingCell(null);
+      setLinkTargetRowIndex(null);
       setActiveCsvPath(sourcePath);
       setNotice(opened.schemaWasMissing ? '未找到 Schema，已按文本列加载；首次保存会生成 Schema。' : '文件已加载。');
     } catch (error) {
@@ -441,6 +469,7 @@ export default function App() {
       setSelectedRows(new Set());
       setSelectedCells(new Set());
       setEditingCell(null);
+      setLinkTargetRowIndex(null);
       setActiveCsvPath(null);
       setNotice('已新建 CSV 数据包，请添加列和数据行。');
     } catch (error) {
@@ -549,20 +578,27 @@ export default function App() {
     setNotice('行已删除，关联 JSON 没有自动删除。');
   };
 
-  const saveColumnDialog = (name: string, type: ColumnType) => {
+  const saveColumnDialog = (name: string, type: ColumnType, linkSheet?: string) => {
     if (!document || !columnDialog) return;
     const trimmed = name.trim();
     if (!trimmed || document.schema.columns.some((column, index) => index !== columnDialog.index && column.name === trimmed)) {
       setNotice('列名不能为空且不能重复。');
       return;
     }
+    if (linkSheet !== undefined && !linkSheet) {
+      setNotice('Link 列必须选择一个关联表。');
+      return;
+    }
+    const nextColumn: ColumnSchema = linkSheet
+      ? { name: trimmed, type, editorType: 'link', linkSheet }
+      : { name: trimmed, type };
     changeDocument((current) => {
       const next = cloneDocument(current);
       if (columnDialog.mode === 'edit') {
         if (columnDialog.index === 0) return current;
-        next.schema.columns[columnDialog.index] = { name: trimmed, type };
+        next.schema.columns[columnDialog.index] = nextColumn;
       } else {
-        next.schema.columns.splice(columnDialog.index, 0, { name: trimmed, type });
+        next.schema.columns.splice(columnDialog.index, 0, nextColumn);
         next.rows.forEach((row) => row.splice(columnDialog.index, 0, ''));
       }
       return next;
@@ -627,6 +663,27 @@ export default function App() {
       setNotice('已在 VS Code 中打开 JSON。保存 CSV 前会重新校验 JSON。');
     } catch (error) {
       setNotice(`无法打开 JSON：${messageFrom(error)}`);
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const openLinkedRow = async (tableName: string, rowId: string) => {
+    if (!rowId) return;
+    if (isDirty && !window.confirm('当前有未保存修改，继续跳转将丢失这些修改。')) return;
+    setIsBusy(true);
+    try {
+      const result = await api.openLinkedRow(tableName, rowId);
+      replaceDocument(result.document, true);
+      setSavedSnapshot(JSON.stringify(result.document));
+      setSelectedRows(new Set());
+      setSelectedCells(new Set());
+      setEditingCell(null);
+      setActiveCsvPath(result.path);
+      setLinkTargetRowIndex(result.rowIndex);
+      setNotice(`已跳转到 ${tableName}.${rowId}。`);
+    } catch (error) {
+      setNotice(`无法跳转关联数据：${messageFrom(error)}`);
     } finally {
       setIsBusy(false);
     }
@@ -923,7 +980,7 @@ export default function App() {
                                     <sup>{header.column.getSortIndex() + 1}</sup>
                                   )}
                                 </button>
-                                <small>{typeLabel(column.type)}</small>
+                                <small>{columnTypeLabel(column)}</small>
                                 <input
                                   className="column-filter-input"
                                   value={String(header.column.getFilterValue() ?? '')}
@@ -943,7 +1000,14 @@ export default function App() {
                         const rowIndex = tableRow.original.sourceIndex;
                         const row = tableRow.original.values;
                         return (
-                          <tr key={tableRow.id} className={selectedRows.has(rowIndex) ? 'is-selected' : ''}>
+                          <tr
+                            key={tableRow.id}
+                            data-row-index={rowIndex}
+                            className={[
+                              selectedRows.has(rowIndex) ? 'is-selected' : '',
+                              linkTargetRowIndex === rowIndex ? 'is-link-target' : '',
+                            ].filter(Boolean).join(' ')}
+                          >
                             <td className="select-column"><input type="checkbox" aria-label={`选择原始第 ${rowIndex + 1} 行`} checked={selectedRows.has(rowIndex)} onChange={() => setSelectedRows((current) => { const next = new Set(current); next.has(rowIndex) ? next.delete(rowIndex) : next.add(rowIndex); return next; })} /></td>
                             <td className="index-column">{rowIndex + 1}</td>
                             {document.schema.columns.map((column, columnIndex) => {
@@ -973,7 +1037,27 @@ export default function App() {
                                     }
                                   }}
                                 >
-                                  {isEditing || column.type === 'json_ref' ? (
+                                  {column.type === 'json_ref' ? (
+                                    <CellEditor
+                                      column={column}
+                                      value={row[columnIndex] ?? ''}
+                                      onChange={(value) => updateCell(rowIndex, columnIndex, value)}
+                                      onCreateReference={() => createReference(rowIndex, columnIndex)}
+                                      onOpenReference={() => openReference(row[columnIndex])}
+                                      disabled={isBusy}
+                                      autoFocus
+                                    />
+                                  ) : column.editorType === 'link' && column.linkSheet ? (
+                                    <LinkCell
+                                      value={row[columnIndex]}
+                                      tableName={column.linkSheet}
+                                      isArray={column.type === 'string_array'}
+                                      disabled={isBusy}
+                                      onOpen={(value) => openLinkedRow(column.linkSheet!, value)}
+                                      onChange={(value) => updateCell(rowIndex, columnIndex, value)}
+                                      onFocus={() => setEditingCell(key)}
+                                    />
+                                  ) : isEditing ? (
                                     <CellEditor
                                       column={column}
                                       value={row[columnIndex] ?? ''}
@@ -1021,6 +1105,7 @@ export default function App() {
         <ColumnDialog
           mode={columnDialog.mode}
           column={columnDialog.mode === 'edit' ? document.schema.columns[columnDialog.index] : undefined}
+          siblingSheets={siblingSheets}
           onCancel={() => setColumnDialog(null)}
           onSubmit={saveColumnDialog}
         />
@@ -1313,6 +1398,56 @@ function CellEditor({ column, value, onChange, onCreateReference, onOpenReferenc
   return <input className="cell-input" value={value} onChange={(event) => onChange(event.target.value)} onFocus={(event) => event.currentTarget.select()} inputMode={column.type === 'int' || column.type === 'float' || column.type === 'vector2int' ? 'decimal' : 'text'} autoFocus={autoFocus} />;
 }
 
+function LinkCell({ value, tableName, isArray, disabled, onOpen, onChange, onFocus }: {
+  value: string;
+  tableName: string;
+  isArray: boolean;
+  disabled: boolean;
+  onOpen: (value: string) => void;
+  onChange: (value: string) => void;
+  onFocus: () => void;
+}) {
+  const [input, setInput] = useState('');
+  const values = value
+    ? (isArray ? value.split('|').filter((entry) => entry.length > 0) : [value])
+    : [];
+  const removeValue = (index: number) => {
+    const next = values.filter((_, valueIndex) => valueIndex !== index);
+    onChange(isArray ? next.join('|') : '');
+  };
+  const addValue = () => {
+    const nextValue = input.trim();
+    if (!nextValue || (!isArray && values.length > 0)) return;
+    if (!values.includes(nextValue)) {
+      onChange(isArray ? [...values, nextValue].join('|') : nextValue);
+    }
+    setInput('');
+  };
+  return <div className="link-tags" onMouseDown={(event) => event.stopPropagation()}>
+    {values.map((entry, index) => (
+      <span className="link-tag" key={`${entry}-${index}`}>
+        <button className="link-tag-label" onClick={() => onOpen(entry)} disabled={disabled} title={`跳转到 ${tableName}.${entry}`}>{entry}</button>
+        <button className="link-tag-remove" onClick={() => removeValue(index)} disabled={disabled} aria-label={`删除关联值 ${entry}`}><X size={14} /></button>
+      </span>
+    ))}
+    {(isArray || values.length === 0) && (
+      <input
+        className="link-tags-input"
+        value={input}
+        disabled={disabled}
+        placeholder="按回车键 Enter 创建标签"
+        onFocus={onFocus}
+        onChange={(event) => setInput(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key !== 'Enter') return;
+          event.preventDefault();
+          addValue();
+        }}
+      />
+    )}
+  </div>;
+}
+
 function TextCellEditor({ value, onChange, autoFocus }: { value: string; onChange: (value: string) => void; autoFocus: boolean }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -1367,7 +1502,7 @@ function HeaderContextMenu({ column, isId, canMoveRight, style, onEdit, onDelete
   onAddRight: () => void;
 }) {
   return <div className="header-context-menu" style={style} onMouseDown={(event) => event.stopPropagation()}>
-    <div className="menu-heading">{column.name} <span>{typeLabel(column.type)}</span></div>
+    <div className="menu-heading">{column.name} <span>{columnTypeLabel(column)}</span></div>
     {isId && <div className="menu-locked">id 是锁定主键列</div>}
     <button className="menu-item" disabled={isId} onClick={onEdit}>编辑名称和类型</button>
     <button className="menu-item" disabled={!canMoveRight} onClick={onMoveRight}>向右移动</button>
@@ -1377,26 +1512,61 @@ function HeaderContextMenu({ column, isId, canMoveRight, style, onEdit, onDelete
   </div>;
 }
 
-function ColumnDialog({ mode, column, onCancel, onSubmit }: {
+function ColumnDialog({ mode, column, siblingSheets, onCancel, onSubmit }: {
   mode: 'edit' | 'add';
   column?: ColumnSchema;
+  siblingSheets: string[];
   onCancel: () => void;
-  onSubmit: (name: string, type: ColumnType) => void;
+  onSubmit: (name: string, type: ColumnType, linkSheet?: string) => void;
 }) {
   const [name, setName] = useState(column?.name ?? 'new_column');
   const [type, setType] = useState<ColumnType>(column?.type ?? 'string');
+  const [isLink, setIsLink] = useState(column?.editorType === 'link');
+  const [linkSheet, setLinkSheet] = useState(column?.linkSheet ?? '');
+  const supportsLink = type === 'string' || type === 'string_array';
+  useEffect(() => {
+    if (!isLink || linkSheet) return;
+    setLinkSheet(siblingSheets[0] ?? '');
+  }, [isLink, linkSheet, siblingSheets]);
+  useEffect(() => {
+    if (!supportsLink && isLink) setIsLink(false);
+  }, [isLink, supportsLink]);
+  const submit = () => onSubmit(
+    name,
+    type,
+    isLink ? linkSheet : undefined,
+  );
   return <div className="modal-backdrop" role="presentation" onMouseDown={onCancel}>
     <section className="column-dialog" role="dialog" aria-modal="true" aria-label={mode === 'edit' ? '编辑列' : '新增列'} onMouseDown={(event) => event.stopPropagation()}>
       <h2>{mode === 'edit' ? '编辑列' : '在右侧新增列'}</h2>
-      <label>列名<input autoFocus value={name} onChange={(event) => setName(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && onSubmit(name, type)} /></label>
-      <label>类型<select value={type} onChange={(event) => setType(event.target.value as ColumnType)}>{columnTypes.map((entry) => <option key={entry.value} value={entry.value}>{entry.label}</option>)}</select></label>
-      <div className="dialog-actions"><button className="button button-secondary" onClick={onCancel}>取消</button><button className="button button-primary" onClick={() => onSubmit(name, type)}>确定</button></div>
+      <label>列名<input autoFocus value={name} onChange={(event) => setName(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && submit()} /></label>
+      <label>类型<select value={type} onChange={(event) => setType(event.target.value as ColumnType)}>
+        {columnTypes.map((entry) => <option key={entry.value} value={entry.value}>{entry.label}</option>)}
+      </select></label>
+      <label className={`link-option${supportsLink ? '' : ' is-disabled'}`}>
+        <input type="checkbox" checked={isLink} disabled={!supportsLink} onChange={(event) => setIsLink(event.target.checked)} />
+        <span>Link（点击标签跳转到关联表的 id）</span>
+      </label>
+      {isLink && (
+        <label>关联表<select value={linkSheet} onChange={(event) => setLinkSheet(event.target.value)}>
+          {siblingSheets.length === 0 && <option value="">当前文件夹没有其他 Sheet</option>}
+          {siblingSheets.map((sheet) => <option key={sheet} value={sheet}>{sheet}</option>)}
+        </select></label>
+      )}
+      <div className="dialog-actions"><button className="button button-secondary" onClick={onCancel}>取消</button><button className="button button-primary" disabled={isLink && !linkSheet} onClick={submit}>确定</button></div>
     </section>
   </div>;
 }
 
 function typeLabel(type: ColumnType) {
   return columnTypes.find((entry) => entry.value === type)?.label ?? type;
+}
+
+function columnTypeLabel(column: ColumnSchema) {
+  const baseType = typeLabel(column.type);
+  return column.editorType === 'link'
+    ? `${baseType} · Link → ${column.linkSheet ?? '?'}`
+    : baseType;
 }
 
 function messageFrom(error: unknown) {

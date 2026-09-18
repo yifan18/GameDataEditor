@@ -12,6 +12,9 @@ export type ColumnType =
 export interface ColumnSchema {
   name: string;
   type: ColumnType;
+  editorType?: 'link';
+  /** When present, this string column links to the id column of a sibling sheet. */
+  linkSheet?: string;
 }
 
 export interface TableSchema {
@@ -38,6 +41,12 @@ export interface SaveResult {
   saved: boolean;
   issues: ValidationIssue[];
   message?: string;
+}
+
+export interface LinkedRowResult {
+  document: TableDocument;
+  path: string;
+  rowIndex: number;
 }
 
 /** A CSV file or directory displayed beneath a managed folder root. */

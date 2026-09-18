@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import type {
   FolderTreeRoot,
+  LinkedRowResult,
   SaveResult,
   TableDocument,
   ValidationIssue,
@@ -15,6 +16,9 @@ export const api = {
     invoke<FolderTreeRoot[]>('remove_folder_root', { path }),
   openCsvAtPath: (path: string) =>
     invoke<TableDocument>('open_csv_from_folder', { path }),
+  listSiblingSheets: () => invoke<string[]>('list_sibling_sheets'),
+  openLinkedRow: (tableName: string, rowId: string) =>
+    invoke<LinkedRowResult>('open_linked_row', { tableName, rowId }),
   createCsv: () => invoke<TableDocument | null>('create_csv_dialog'),
   validate: (document: TableDocument) =>
     invoke<ValidationIssue[]>('validate_document', { document }),

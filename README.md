@@ -13,6 +13,7 @@ items/
 
 - CSV 首列固定为小写 `id`，按字符串保存，不能为空且全表唯一。
 - `items.schema.json` 保存列顺序及类型：`string`、`int`、`float`、`bool`、`json_ref`、`enum`、`string_array`、`vector2int`、`string_dictionary`。
+- Link 是 `string` 与 `string_array` 列上的可选能力，通过 `editorType: "link"` 标记，并由 `linkSheet` 指向同目录下的另一张表；点击标签时会精确匹配目标表的 `id` 并高亮对应行。
 - `json_ref` 单元格只存小写 UUID v4；文件路径由编辑器推导为 `items/<uuid>.json`。
 - 首次打开没有 Schema 的合法 CSV 时，除 `id` 外的列按 `string` 加载；首次保存自动创建 Schema。
 
@@ -24,6 +25,8 @@ npm run tauri dev
 ```
 
 可直接点击“新建 CSV”创建空数据包：工具会创建 CSV、同名 Schema 和同名 JSON 目录。打开或新建后可编辑行、列和列类型。`json_ref` 单元格支持创建 JSON 文件，并通过本机 `code` 命令在 VS Code 中打开。复制行会深复制 JSON 文件并生成新 UUID。
+
+配置 `string` 或 `string_array` 列时可额外勾选 `Link`，再从下拉框选择同一文件夹内除当前表之外的目标 Sheet。例如 `Monster.ability` 指向 `Ability` 时，Schema 列定义为 `{ "name": "ability", "type": "string", "editorType": "link", "linkSheet": "Ability" }`。关联仅按完整标签单向跳转，不会在目标表生成反向入口；数组标签在 CSV 中以 `|` 分隔。
 
 “导出数据包”会导出 CSV、Schema 与全部被引用 JSON；“清理未引用 JSON”只会删除同名目录中 UUID 格式的孤儿文件。
 

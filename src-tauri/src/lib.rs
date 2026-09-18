@@ -117,6 +117,14 @@ pub struct ColumnSchema {
     name: String,
     #[serde(rename = "type")]
     column_type: ColumnType,
+    #[serde(
+        rename = "editorType",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    editor_type: Option<String>,
+    #[serde(rename = "linkSheet", default, skip_serializing_if = "Option::is_none")]
+    link_sheet: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -149,6 +157,14 @@ pub struct SaveResult {
     saved: bool,
     issues: Vec<ValidationIssue>,
     message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkedRowResult {
+    document: TableDocument,
+    path: String,
+    row_index: usize,
 }
 
 #[tauri::command]
@@ -270,6 +286,37 @@ fn open_csv_from_folder(
 }
 
 #[tauri::command]
+fn list_sibling_sheets(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+    let active_session = state.session.lock().map_err(|_| "无法锁定当前文件会话。")?;
+    let session = active_session.as_ref().ok_or("请先打开一个 CSV 文件。")?;
+    sibling_sheet_names(&session.csv_path)
+}
+
+#[tauri::command]
+fn open_linked_row(
+    state: tauri::State<'_, AppState>,
+    table_name: String,
+    row_id: String,
+) -> Result<LinkedRowResult, String> {
+    let mut active_session = state.session.lock().map_err(|_| "无法锁定当前文件会话。")?;
+    let current_session = active_session.as_ref().ok_or("请先打开一个 CSV 文件。")?;
+    let target_path = sibling_sheet_path(&current_session.csv_path, &table_name)?;
+    let (document, target_session) = load_table_package(&target_path)?;
+    let row_index = document
+        .rows
+        .iter()
+        .position(|row| row.first().map(String::as_str) == Some(row_id.as_str()))
+        .ok_or_else(|| format!("{} 表中没有 id 为 {} 的行。", table_name, row_id))?;
+    let path = target_session.csv_path.to_string_lossy().into_owned();
+    *active_session = Some(target_session);
+    Ok(LinkedRowResult {
+        document,
+        path,
+        row_index,
+    })
+}
+
+#[tauri::command]
 fn create_csv_dialog(state: tauri::State<'_, AppState>) -> Result<Option<TableDocument>, String> {
     let Some(selected_path) = FileDialog::new()
         .set_title("新建游戏数据 CSV")
@@ -309,6 +356,8 @@ fn create_table_package(csv_path: PathBuf) -> Result<(TableDocument, TableSessio
             columns: vec![ColumnSchema {
                 name: "id".to_string(),
                 column_type: ColumnType::String,
+                editor_type: None,
+                link_sheet: None,
             }],
         },
         rows: Vec::new(),
@@ -937,6 +986,63 @@ fn initialize_folder_state(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+fn sibling_sheet_names(csv_path: &Path) -> Result<Vec<String>, String> {
+    let parent = csv_path.parent().ok_or("CSV 缺少上级目录。")?;
+    let current_name = csv_path.file_stem().and_then(|name| name.to_str());
+    let entries =
+        fs::read_dir(parent).map_err(|error| format!("无法读取当前 CSV 目录：{error}"))?;
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("无法读取当前 CSV 目录项：{error}"))?;
+        let path = entry.path();
+        if !path.is_file()
+            || path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(|extension| !extension.eq_ignore_ascii_case("csv"))
+                .unwrap_or(true)
+        {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if Some(name) != current_name {
+            names.push(name.to_string());
+        }
+    }
+    names.sort_by_key(|name| name.to_lowercase());
+    Ok(names)
+}
+
+fn sibling_sheet_path(csv_path: &Path, table_name: &str) -> Result<PathBuf, String> {
+    if table_name.trim().is_empty() {
+        return Err("关联表不能为空。".to_string());
+    }
+    let current_name = csv_path.file_stem().and_then(|name| name.to_str());
+    if current_name == Some(table_name) {
+        return Err("关联表不能是当前表。".to_string());
+    }
+    let parent = csv_path.parent().ok_or("CSV 缺少上级目录。")?;
+    for entry in fs::read_dir(parent).map_err(|error| format!("无法读取当前 CSV 目录：{error}"))?
+    {
+        let path = entry
+            .map_err(|error| format!("无法读取当前 CSV 目录项：{error}"))?
+            .path();
+        if path.is_file()
+            && path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(|extension| extension.eq_ignore_ascii_case("csv"))
+                == Some(true)
+            && path.file_stem().and_then(|name| name.to_str()) == Some(table_name)
+        {
+            return Ok(path);
+        }
+    }
+    Err(format!("当前文件夹中没有找到 {}.csv。", table_name))
+}
+
 fn load_table_package(csv_path: &Path) -> Result<(TableDocument, TableSession), String> {
     let csv_path = csv_path
         .canonicalize()
@@ -977,6 +1083,8 @@ fn load_table_package(csv_path: &Path) -> Result<(TableDocument, TableSession), 
                     .map(|name| ColumnSchema {
                         name,
                         column_type: ColumnType::String,
+                        editor_type: None,
+                        link_sheet: None,
                     })
                     .collect(),
             },
@@ -1039,7 +1147,12 @@ fn ensure_schema_matches_headers(schema: &TableSchema, headers: &[String]) -> Re
     let valid_id = schema
         .columns
         .first()
-        .map(|column| column.name == "id" && column.column_type == ColumnType::String)
+        .map(|column| {
+            column.name == "id"
+                && column.column_type == ColumnType::String
+                && column.editor_type.is_none()
+                && column.link_sheet.is_none()
+        })
         .unwrap_or(false);
     if schema.primary_key != "id" || !valid_id {
         return Err("Schema 必须将第一列 id 定义为字符串主键。".to_string());
@@ -1053,6 +1166,15 @@ fn ensure_schema_matches_headers(schema: &TableSchema, headers: &[String]) -> Re
     if schema_headers != csv_headers {
         return Err("Schema 列定义与 CSV 表头不一致，请先修复后再打开。".to_string());
     }
+    if schema
+        .columns
+        .iter()
+        .any(|column| !has_valid_link_config(column))
+    {
+        return Err(
+            "Schema 的 Link 列必须是 string 类型，并同时配置 editorType 和 linkSheet。".to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -1064,7 +1186,12 @@ fn validate_document_for_session(
     let columns = &document.schema.columns;
     let valid_id = columns
         .first()
-        .map(|column| column.name == "id" && column.column_type == ColumnType::String)
+        .map(|column| {
+            column.name == "id"
+                && column.column_type == ColumnType::String
+                && column.editor_type.is_none()
+                && column.link_sheet.is_none()
+        })
         .unwrap_or(false);
     if document.schema.primary_key != "id" || !valid_id {
         issues.push(issue(
@@ -1083,6 +1210,14 @@ fn validate_document_for_session(
                 None,
                 Some(&column.name),
                 "列名不能为空且不能重复。",
+            ));
+        }
+        if !has_valid_link_config(column) {
+            issues.push(issue(
+                None,
+                None,
+                Some(&column.name),
+                "Link 必须是 string 类型并配置关联表。",
             ));
         }
     }
@@ -1141,6 +1276,21 @@ fn validate_document_for_session(
         }
     }
     issues
+}
+
+fn has_valid_link_config(column: &ColumnSchema) -> bool {
+    match (&column.editor_type, &column.link_sheet) {
+        (None, None) => true,
+        (Some(editor_type), Some(sheet)) => {
+            editor_type == "link"
+                && matches!(
+                    column.column_type,
+                    ColumnType::String | ColumnType::StringArray
+                )
+                && !sheet.trim().is_empty()
+        }
+        _ => false,
+    }
 }
 
 fn validate_vector2int(value: &str) -> Result<(), String> {
@@ -1476,6 +1626,8 @@ pub fn run() {
             list_folder_tree,
             remove_folder_root,
             open_csv_from_folder,
+            list_sibling_sheets,
+            open_linked_row,
             create_csv_dialog,
             validate_document,
             save_document,
@@ -1510,6 +1662,37 @@ mod tests {
     }
 
     #[test]
+    fn link_column_stays_a_string_in_schema() {
+        let schema: TableSchema = serde_json::from_str(
+            r#"{"version":1,"primaryKey":"id","columns":[{"name":"id","type":"string"},{"name":"ability","type":"string","editorType":"link","linkSheet":"Ability"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(schema.columns[1].column_type, ColumnType::String);
+        assert_eq!(schema.columns[1].editor_type.as_deref(), Some("link"));
+        assert_eq!(schema.columns[1].link_sheet.as_deref(), Some("Ability"));
+
+        let serialized = serde_json::to_value(schema).unwrap();
+        assert_eq!(serialized["columns"][1]["type"], "string");
+        assert_eq!(serialized["columns"][1]["editorType"], "link");
+        assert_eq!(serialized["columns"][1]["linkSheet"], "Ability");
+    }
+
+    #[test]
+    fn sibling_sheets_only_include_other_csv_files_in_the_same_folder() {
+        let root = test_directory("sibling-sheets");
+        fs::write(root.join("Monster.csv"), b"id\n").unwrap();
+        fs::write(root.join("Ability.csv"), b"id\n").unwrap();
+        fs::write(root.join("notes.txt"), b"").unwrap();
+        fs::create_dir(root.join("nested")).unwrap();
+        fs::write(root.join("nested").join("Hidden.csv"), b"id\n").unwrap();
+
+        assert_eq!(
+            sibling_sheet_names(&root.join("Monster.csv")).unwrap(),
+            vec!["Ability".to_string()]
+        );
+    }
+
+    #[test]
     fn id_is_required_and_unique() {
         let document = TableDocument {
             table_name: "items".to_string(),
@@ -1520,6 +1703,8 @@ mod tests {
                 columns: vec![ColumnSchema {
                     name: "id".to_string(),
                     column_type: ColumnType::String,
+                    editor_type: None,
+                    link_sheet: None,
                 }],
             },
             rows: vec![
@@ -1550,22 +1735,32 @@ mod tests {
                     ColumnSchema {
                         name: "id".to_string(),
                         column_type: ColumnType::String,
+                        editor_type: None,
+                        link_sheet: None,
                     },
                     ColumnSchema {
                         name: "group".to_string(),
                         column_type: ColumnType::Enum,
+                        editor_type: None,
+                        link_sheet: None,
                     },
                     ColumnSchema {
                         name: "tags".to_string(),
                         column_type: ColumnType::StringArray,
+                        editor_type: None,
+                        link_sheet: None,
                     },
                     ColumnSchema {
                         name: "range".to_string(),
                         column_type: ColumnType::Vector2Int,
+                        editor_type: None,
+                        link_sheet: None,
                     },
                     ColumnSchema {
                         name: "props".to_string(),
                         column_type: ColumnType::StringDictionary,
+                        editor_type: None,
+                        link_sheet: None,
                     },
                 ],
             },
