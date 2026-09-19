@@ -157,6 +157,7 @@ export default function App() {
   const [selectedRows, setSelectedRows] = useState<Set<number>>(new Set());
   const [selectedCells, setSelectedCells] = useState<Set<string>>(new Set());
   const [editingCell, setEditingCell] = useState<string | null>(null);
+  const [seededEditingCell, setSeededEditingCell] = useState<string | null>(null);
   const [folderRoots, setFolderRoots] = useState<FolderTreeRoot[]>([]);
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
   const [activeCsvPath, setActiveCsvPath] = useState<string | null>(null);
@@ -687,6 +688,20 @@ export default function App() {
     }, `cell:${rowIndex}:${columnIndex}`);
   };
 
+  const updateSelectedCellValues = useCallback((keys: Set<string>, value: string, historyGroup: string) => {
+    changeDocument((current) => {
+      let next: TableDocument | null = null;
+      keys.forEach((key) => {
+        const [rowIndex, columnIndex] = key.split(':').map(Number);
+        if (current.rows[rowIndex]?.[columnIndex] !== undefined && current.rows[rowIndex][columnIndex] !== value) {
+          next ??= cloneDocument(current);
+          next.rows[rowIndex][columnIndex] = value;
+        }
+      });
+      return next ?? current;
+    }, historyGroup);
+  }, [changeDocument]);
+
   const addRowAfter = (rowIndex: number) => {
     const insertIndex = rowIndex + 1;
     changeDocument((current) => {
@@ -967,8 +982,10 @@ export default function App() {
     const interactiveTarget = (event.target as HTMLElement).closest('input, textarea, select, button');
     if (interactiveTarget && (editingCell === key || interactiveTarget.tagName === 'BUTTON')) return;
     event.preventDefault();
+    if (window.document.activeElement instanceof HTMLElement) window.document.activeElement.blur();
     activeHistoryGroup.current = null;
     setEditingCell(null);
+    setSeededEditingCell(null);
     const start = { rowPosition, columnIndex };
     dragSelectionStart.current = start;
     selectCellRange(start, start);
@@ -1048,6 +1065,83 @@ export default function App() {
     window.addEventListener('paste', handlePaste);
     return () => window.removeEventListener('paste', handlePaste);
   }, [document, editingCell, selectedCells, visibleSourceIndices]);
+
+  useEffect(() => {
+    const handleDeleteSelectedCells = (event: KeyboardEvent) => {
+      if (
+        event.defaultPrevented
+        || event.isComposing
+        || (event.key !== 'Delete' && event.key !== 'Backspace')
+        || !document
+        || isBusy
+        || editingCell
+        || selectedCells.size === 0
+      ) return;
+
+      const target = event.target;
+      if (target instanceof Element && target.closest('input, textarea, select, [contenteditable="true"]')) return;
+
+      event.preventDefault();
+      changeDocument((current) => {
+        let next: TableDocument | null = null;
+        selectedCells.forEach((key) => {
+          const [rowIndex, columnIndex] = key.split(':').map(Number);
+          if (current.rows[rowIndex]?.[columnIndex]) {
+            next ??= cloneDocument(current);
+            next.rows[rowIndex][columnIndex] = '';
+          }
+        });
+        return next ?? current;
+      });
+      setNotice(`已清空 ${selectedCells.size} 个单元格。`);
+    };
+
+    window.addEventListener('keydown', handleDeleteSelectedCells);
+    return () => window.removeEventListener('keydown', handleDeleteSelectedCells);
+  }, [changeDocument, document, editingCell, isBusy, selectedCells]);
+
+  useEffect(() => {
+    const handleOverwriteSelectedCells = (event: KeyboardEvent) => {
+      const isPrintableKey = event.key.length === 1 && !event.ctrlKey && !event.metaKey && !event.altKey;
+      const isCompositionStart = event.key === 'Process' || event.keyCode === 229;
+      if (
+        event.defaultPrevented
+        || (event.isComposing && !isCompositionStart)
+        || (!isPrintableKey && !isCompositionStart)
+        || !document
+        || isBusy
+        || editingCell
+        || selectedCells.size === 0
+      ) return;
+
+      const target = event.target;
+      if (target instanceof Element && target.closest('input, textarea, select, [contenteditable="true"]')) return;
+
+      const visiblePositionBySource = new Map(visibleSourceIndices.map((sourceIndex, position) => [sourceIndex, position]));
+      const firstCell = [...selectedCells]
+        .map((key) => {
+          const [rowIndex, columnIndex] = key.split(':').map(Number);
+          return { key, rowIndex, columnIndex, rowPosition: visiblePositionBySource.get(rowIndex) ?? rowIndex };
+        })
+        .sort((left, right) => left.rowPosition - right.rowPosition || left.columnIndex - right.columnIndex)[0];
+      if (!firstCell) return;
+
+      const column = document.schema.columns[firstCell.columnIndex];
+      if (!column || column.type === 'json_ref' || column.editorType === 'link') return;
+
+      const historyGroup = selectedCells.size === 1 ? `cell:${firstCell.key}` : `cells:${firstCell.key}`;
+      activeHistoryGroup.current = null;
+      setEditingCell(firstCell.key);
+      setSeededEditingCell(isPrintableKey ? firstCell.key : null);
+      if (isPrintableKey) {
+        event.preventDefault();
+        updateSelectedCellValues(selectedCells, event.key, historyGroup);
+      }
+    };
+
+    window.addEventListener('keydown', handleOverwriteSelectedCells);
+    return () => window.removeEventListener('keydown', handleOverwriteSelectedCells);
+  }, [document, editingCell, isBusy, selectedCells, updateSelectedCellValues, visibleSourceIndices]);
 
   return (
     <Theme
@@ -1189,6 +1283,9 @@ export default function App() {
                             key={tableRow.id}
                             data-row-index={rowIndex}
                             onContextMenu={(event) => openRowMenu(event, rowIndex)}
+                            onMouseEnter={() => {
+                              if (linkTargetRowIndex === rowIndex) setLinkTargetRowIndex(null);
+                            }}
                             className={[
                               selectedRows.has(rowIndex) ? 'is-selected' : '',
                               linkTargetRowIndex === rowIndex ? 'is-link-target' : '',
@@ -1213,12 +1310,16 @@ export default function App() {
                                   onDoubleClick={(event) => {
                                     event.preventDefault();
                                     setSelectedCells(new Set([key]));
-                                    if (column.type !== 'json_ref') setEditingCell(key);
+                                    if (column.type !== 'json_ref') {
+                                      setSeededEditingCell(key);
+                                      setEditingCell(key);
+                                    }
                                   }}
                                   onBlur={(event) => {
                                     if (isEditing && !event.currentTarget.contains(event.relatedTarget as Node | null)) {
                                       activeHistoryGroup.current = null;
                                       setEditingCell(null);
+                                      setSeededEditingCell(null);
                                     }
                                   }}
                                 >
@@ -1246,11 +1347,18 @@ export default function App() {
                                     <CellEditor
                                       column={column}
                                       value={row[columnIndex] ?? ''}
-                                      onChange={(value) => updateCell(rowIndex, columnIndex, value)}
+                                      onChange={(value) => {
+                                        if (selectedCells.size > 1 && selectedCells.has(key)) {
+                                          updateSelectedCellValues(selectedCells, value, `cells:${key}`);
+                                        } else {
+                                          updateCell(rowIndex, columnIndex, value);
+                                        }
+                                      }}
                                       onCreateReference={() => createReference(rowIndex, columnIndex)}
                                       onOpenReference={() => openReference(row[columnIndex])}
                                       disabled={isBusy}
                                       autoFocus
+                                      selectOnFocus={seededEditingCell !== key}
                                     />
                                   ) : (
                                     <div className={`cell-value${row[columnIndex] ? '' : ' is-empty'}`}>
@@ -1566,7 +1674,7 @@ function TreeError({ message, depth }: { message: string; depth: number }) {
   </div>;
 }
 
-function CellEditor({ column, value, onChange, onCreateReference, onOpenReference, disabled, autoFocus = false }: {
+function CellEditor({ column, value, onChange, onCreateReference, onOpenReference, disabled, autoFocus = false, selectOnFocus = true }: {
   column: ColumnSchema;
   value: string;
   onChange: (value: string) => void;
@@ -1574,6 +1682,7 @@ function CellEditor({ column, value, onChange, onCreateReference, onOpenReferenc
   onOpenReference: () => void;
   disabled: boolean;
   autoFocus?: boolean;
+  selectOnFocus?: boolean;
 }) {
   if (column.type === 'json_ref') {
     return value ? (
@@ -1589,9 +1698,12 @@ function CellEditor({ column, value, onChange, onCreateReference, onOpenReferenc
     </select>;
   }
   if (column.type === 'string') {
-    return <TextCellEditor value={value} onChange={onChange} autoFocus={autoFocus} />;
+    return <TextCellEditor value={value} onChange={onChange} autoFocus={autoFocus} selectOnFocus={selectOnFocus} />;
   }
-  return <input className="cell-input" value={value} onChange={(event) => onChange(event.target.value)} onFocus={(event) => event.currentTarget.select()} inputMode={column.type === 'int' || column.type === 'float' || column.type === 'vector2int' ? 'decimal' : 'text'} autoFocus={autoFocus} />;
+  return <input className="cell-input" value={value} onChange={(event) => onChange(event.target.value)} onFocus={(event) => {
+    if (selectOnFocus) event.currentTarget.select();
+    else event.currentTarget.setSelectionRange(event.currentTarget.value.length, event.currentTarget.value.length);
+  }} inputMode={column.type === 'int' || column.type === 'float' || column.type === 'vector2int' ? 'decimal' : 'text'} autoFocus={autoFocus} />;
 }
 
 function LinkCell({ value, tableName, isArray, disabled, onOpen, onChange, onFocus }: {
@@ -1644,7 +1756,7 @@ function LinkCell({ value, tableName, isArray, disabled, onOpen, onChange, onFoc
   </div>;
 }
 
-function TextCellEditor({ value, onChange, autoFocus }: { value: string; onChange: (value: string) => void; autoFocus: boolean }) {
+function TextCellEditor({ value, onChange, autoFocus, selectOnFocus }: { value: string; onChange: (value: string) => void; autoFocus: boolean; selectOnFocus: boolean }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const fitHeight = useCallback(() => {
@@ -1683,7 +1795,10 @@ function TextCellEditor({ value, onChange, autoFocus }: { value: string; onChang
     value={value}
     autoFocus={autoFocus}
     onChange={(event) => onChange(event.currentTarget.value)}
-    onFocus={(event) => event.currentTarget.select()}
+    onFocus={(event) => {
+      if (selectOnFocus) event.currentTarget.select();
+      else event.currentTarget.setSelectionRange(event.currentTarget.value.length, event.currentTarget.value.length);
+    }}
   />;
 }
 
