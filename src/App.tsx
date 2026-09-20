@@ -1226,11 +1226,6 @@ export default function App() {
                 {document.schemaWasMissing && (
                   <div className="info-banner"><AlertCircle size={16} />未找到同名 Schema；首次保存会创建 <code>{document.tableName}.schema.json</code>。</div>
                 )}
-                <div className="grid-actions">
-                  <div className="table-tools">
-                    <span className="filtered-row-count">显示 {visibleTableRows.length} / {document.rows.length} 行</span>
-                  </div>
-                </div>
                 <div className="table-scroll">
                   <table className="data-grid">
                     <thead>
