@@ -15,6 +15,10 @@ export interface ColumnSchema {
   editorType?: 'link';
   /** When present, this string column links to the id column of a sibling sheet. */
   linkSheet?: string;
+  /** Allowed values for enum columns. */
+  enumValues?: string[];
+  /** Enum values are pipe-delimited in CSV when multiple selection is enabled. */
+  enumMultiple?: boolean;
 }
 
 export interface TableSchema {

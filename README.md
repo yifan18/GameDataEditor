@@ -13,6 +13,7 @@ items/
 
 - CSV 首列固定为小写 `id`，按字符串保存，不能为空且全表唯一。
 - `items.schema.json` 保存列顺序及类型：`string`、`int`、`float`、`bool`、`json_ref`、`enum`、`string_array`、`vector2int`、`string_dictionary`。
+- `enum` 列通过 `enumValues` 保存至少一个可选值；`enumMultiple: true` 时允许多选，CSV 中以 `|` 分隔。单元格值必须全部来自 `enumValues`。
 - Link 是 `string` 与 `string_array` 列上的可选能力，通过 `editorType: "link"` 标记，并由 `linkSheet` 指向同目录下的另一张表；点击标签时会精确匹配目标表的 `id` 并高亮对应行。
 - `json_ref` 单元格只存小写 UUID v4；文件路径由编辑器推导为 `items/<uuid>.json`。
 - 首次打开没有 Schema 的合法 CSV 时，除 `id` 外的列按 `string` 加载；首次保存自动创建 Schema。

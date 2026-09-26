@@ -154,6 +154,14 @@ pub struct ColumnSchema {
     editor_type: Option<String>,
     #[serde(rename = "linkSheet", default, skip_serializing_if = "Option::is_none")]
     link_sheet: Option<String>,
+    #[serde(rename = "enumValues", default, skip_serializing_if = "Vec::is_empty")]
+    enum_values: Vec<String>,
+    #[serde(rename = "enumMultiple", default, skip_serializing_if = "is_false")]
+    enum_multiple: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -389,6 +397,8 @@ fn create_table_package(csv_path: PathBuf) -> Result<(TableDocument, TableSessio
                 column_type: ColumnType::String,
                 editor_type: None,
                 link_sheet: None,
+                enum_values: Vec::new(),
+                enum_multiple: false,
             }],
         },
         rows: Vec::new(),
@@ -1130,6 +1140,8 @@ fn load_table_package(csv_path: &Path) -> Result<(TableDocument, TableSession), 
                         column_type: ColumnType::String,
                         editor_type: None,
                         link_sheet: None,
+                        enum_values: Vec::new(),
+                        enum_multiple: false,
                     })
                     .collect(),
             },
@@ -1266,6 +1278,14 @@ fn validate_document_for_session(
                 "Link 必须是 string 类型并配置关联表。",
             ));
         }
+        if !has_valid_enum_config(column) {
+            issues.push(issue(
+                None,
+                None,
+                Some(&column.name),
+                "Enum 列必须配置至少一个非空、不重复且不含 | 的 enumValues；非 Enum 列不能包含 Enum 配置。",
+            ));
+        }
     }
     let mut ids = HashSet::new();
     for (row_index, row) in document.rows.iter().enumerate() {
@@ -1307,7 +1327,8 @@ fn validate_document_for_session(
                 ColumnType::Bool => (!matches!(value.as_str(), "true" | "false"))
                     .then(|| "必须是 true、false 或留空。".to_string()),
                 ColumnType::JsonRef => validate_json_reference(session, value).err(),
-                ColumnType::Enum | ColumnType::StringArray => None,
+                ColumnType::Enum => validate_enum_value(column, value).err(),
+                ColumnType::StringArray => None,
                 ColumnType::Vector2Int => validate_vector2int(value).err(),
                 ColumnType::StringDictionary => validate_string_dictionary(value).err(),
             };
@@ -1337,6 +1358,41 @@ fn has_valid_link_config(column: &ColumnSchema) -> bool {
         }
         _ => false,
     }
+}
+
+fn has_valid_enum_config(column: &ColumnSchema) -> bool {
+    if column.column_type != ColumnType::Enum {
+        return column.enum_values.is_empty() && !column.enum_multiple;
+    }
+    if column.enum_values.is_empty() {
+        return false;
+    }
+    let mut values = HashSet::new();
+    column.enum_values.iter().all(|value| {
+        !value.is_empty()
+            && value.trim() == value
+            && !value.contains('|')
+            && values.insert(value.as_str())
+    })
+}
+
+fn validate_enum_value(column: &ColumnSchema, value: &str) -> Result<(), String> {
+    let selected = if column.enum_multiple {
+        value.split('|').collect::<Vec<_>>()
+    } else {
+        vec![value]
+    };
+    let mut seen = HashSet::new();
+    if selected.iter().any(|entry| {
+        !column.enum_values.iter().any(|allowed| allowed == *entry) || !seen.insert(*entry)
+    }) {
+        return Err(if column.enum_multiple {
+            "每个值都必须来自 Enum 列表，且不能重复。".to_string()
+        } else {
+            "必须是 Enum 列表中的一个值。".to_string()
+        });
+    }
+    Ok(())
 }
 
 fn validate_vector2int(value: &str) -> Result<(), String> {
@@ -1725,6 +1781,29 @@ mod tests {
     }
 
     #[test]
+    fn enum_config_and_values_are_strictly_validated() {
+        let mut column = ColumnSchema {
+            name: "rarity".to_string(),
+            column_type: ColumnType::Enum,
+            editor_type: None,
+            link_sheet: None,
+            enum_values: vec!["Common".to_string(), "Rare".to_string()],
+            enum_multiple: false,
+        };
+        assert!(has_valid_enum_config(&column));
+        assert!(validate_enum_value(&column, "Common").is_ok());
+        assert!(validate_enum_value(&column, "Unknown").is_err());
+
+        column.enum_multiple = true;
+        assert!(validate_enum_value(&column, "Common|Rare").is_ok());
+        assert!(validate_enum_value(&column, "Common|Unknown").is_err());
+        assert!(validate_enum_value(&column, "Rare|Rare").is_err());
+
+        column.enum_values.clear();
+        assert!(!has_valid_enum_config(&column));
+    }
+
+    #[test]
     fn sibling_sheets_only_include_other_csv_files_in_the_same_folder() {
         let root = test_directory("sibling-sheets");
         fs::write(root.join("Monster.csv"), b"id\n").unwrap();
@@ -1753,6 +1832,8 @@ mod tests {
                     column_type: ColumnType::String,
                     editor_type: None,
                     link_sheet: None,
+                    enum_values: Vec::new(),
+                    enum_multiple: false,
                 }],
             },
             rows: vec![
@@ -1786,30 +1867,40 @@ mod tests {
                         column_type: ColumnType::String,
                         editor_type: None,
                         link_sheet: None,
+                        enum_values: Vec::new(),
+                        enum_multiple: false,
                     },
                     ColumnSchema {
                         name: "group".to_string(),
                         column_type: ColumnType::Enum,
                         editor_type: None,
                         link_sheet: None,
+                        enum_values: vec!["Common".to_string(), "Rare".to_string()],
+                        enum_multiple: false,
                     },
                     ColumnSchema {
                         name: "tags".to_string(),
                         column_type: ColumnType::StringArray,
                         editor_type: None,
                         link_sheet: None,
+                        enum_values: Vec::new(),
+                        enum_multiple: false,
                     },
                     ColumnSchema {
                         name: "range".to_string(),
                         column_type: ColumnType::Vector2Int,
                         editor_type: None,
                         link_sheet: None,
+                        enum_values: Vec::new(),
+                        enum_multiple: false,
                     },
                     ColumnSchema {
                         name: "props".to_string(),
                         column_type: ColumnType::StringDictionary,
                         editor_type: None,
                         link_sheet: None,
+                        enum_values: Vec::new(),
+                        enum_multiple: false,
                     },
                 ],
             },

@@ -26,6 +26,7 @@ import {
   FileSpreadsheet,
   Folder,
   FolderOpen,
+  GripVertical,
   LoaderCircle,
   Moon,
   Plus,
@@ -144,7 +145,13 @@ function initialAppearance(): AppAppearance {
 function cloneDocument(document: TableDocument): TableDocument {
   return {
     ...document,
-    schema: { ...document.schema, columns: document.schema.columns.map((column) => ({ ...column })) },
+    schema: {
+      ...document.schema,
+      columns: document.schema.columns.map((column) => ({
+        ...column,
+        enumValues: column.enumValues ? [...column.enumValues] : undefined,
+      })),
+    },
     rows: document.rows.map((row) => [...row]),
   };
 }
@@ -785,25 +792,62 @@ export default function App() {
     }
   };
 
-  const saveColumnDialog = (name: string, type: ColumnType, linkSheet?: string) => {
-    if (!document || !columnDialog) return;
+  const saveColumnDialog = (
+    name: string,
+    type: ColumnType,
+    linkSheet?: string,
+    enumValues?: string[],
+    enumMultiple?: boolean,
+  ): string | undefined => {
+    if (!document || !columnDialog) return '当前没有可编辑的列。';
     const trimmed = name.trim();
     if (!trimmed || document.schema.columns.some((column, index) => index !== columnDialog.index && column.name === trimmed)) {
-      setNotice('列名不能为空且不能重复。');
-      return;
+      return '列名不能为空且不能重复。';
     }
     if (linkSheet !== undefined && !linkSheet) {
-      setNotice('Link 列必须选择一个关联表。');
-      return;
+      return 'Link 列必须选择一个关联表。';
     }
-    const nextColumn: ColumnSchema = linkSheet
-      ? { name: trimmed, type, editorType: 'link', linkSheet }
-      : { name: trimmed, type };
+    let migrateEnumValue = (value: string) => value;
+    if (type === 'enum') {
+      if (!enumValues?.length) {
+        return 'Enum 列必须至少配置一个枚举值。';
+      }
+      if (columnDialog.mode === 'edit') {
+        const previousColumn = document.schema.columns[columnDialog.index];
+        const previousValues = previousColumn.type === 'enum' ? previousColumn.enumValues ?? [] : [];
+        const renamedValues = new Map<string, string>();
+        if (previousColumn.type === 'enum' && previousValues.length === enumValues.length) {
+          const removedValues = previousValues.filter((value) => !enumValues.includes(value));
+          const addedValues = enumValues.filter((value) => !previousValues.includes(value));
+          if (removedValues.length === addedValues.length) {
+            removedValues.forEach((previousValue, index) => {
+              renamedValues.set(previousValue, addedValues[index]);
+            });
+          }
+        }
+        migrateEnumValue = (value: string) => {
+          if (!value || renamedValues.size === 0) return value;
+          const values = previousColumn.enumMultiple ? value.split('|') : [value];
+          const migrated = values.map((entry) => renamedValues.get(entry) ?? entry);
+          return enumMultiple ? migrated.join('|') : migrated.length === 1 ? migrated[0] : migrated.join('|');
+        };
+      }
+    }
+    const nextColumn: ColumnSchema = type === 'enum'
+      ? { name: trimmed, type, enumValues, enumMultiple: Boolean(enumMultiple) }
+      : linkSheet
+        ? { name: trimmed, type, editorType: 'link', linkSheet }
+        : { name: trimmed, type };
     changeDocument((current) => {
       const next = cloneDocument(current);
       if (columnDialog.mode === 'edit') {
         if (columnDialog.index === 0) return current;
         next.schema.columns[columnDialog.index] = nextColumn;
+        if (type === 'enum') {
+          next.rows.forEach((row) => {
+            row[columnDialog.index] = migrateEnumValue(row[columnDialog.index] ?? '');
+          });
+        }
       } else {
         next.schema.columns.splice(columnDialog.index, 0, nextColumn);
         next.rows.forEach((row) => row.splice(columnDialog.index, 0, ''));
@@ -816,6 +860,7 @@ export default function App() {
     }
     setNotice(columnDialog.mode === 'edit' ? `已更新 ${trimmed} 列。` : `已在右侧新增 ${trimmed} 列。`);
     setColumnDialog(null);
+    return undefined;
   };
 
   const moveColumn = (index: number, direction: -1 | 1) => {
@@ -986,6 +1031,16 @@ export default function App() {
     activeHistoryGroup.current = null;
     setEditingCell(null);
     setSeededEditingCell(null);
+    if (event.ctrlKey || event.metaKey) {
+      dragSelectionStart.current = null;
+      setSelectedCells((current) => {
+        const next = new Set(current);
+        if (next.has(key)) next.delete(key);
+        else next.add(key);
+        return next;
+      });
+      return;
+    }
     const start = { rowPosition, columnIndex };
     dragSelectionStart.current = start;
     selectCellRange(start, start);
@@ -1318,7 +1373,14 @@ export default function App() {
                                     }
                                   }}
                                 >
-                                  {column.type === 'json_ref' ? (
+                                  {column.type === 'enum' ? (
+                                    <EnumCellEditor
+                                      column={column}
+                                      value={row[columnIndex] ?? ''}
+                                      onChange={(value) => updateCell(rowIndex, columnIndex, value)}
+                                      disabled={isBusy}
+                                    />
+                                  ) : column.type === 'json_ref' ? (
                                     <CellEditor
                                       column={column}
                                       value={row[columnIndex] ?? ''}
@@ -1797,6 +1859,90 @@ function TextCellEditor({ value, onChange, autoFocus, selectOnFocus }: { value: 
   />;
 }
 
+function EnumCellEditor({ column, value, onChange, disabled }: {
+  column: ColumnSchema;
+  value: string;
+  onChange: (value: string) => void;
+  disabled: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const [menuOpensUp, setMenuOpensUp] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const options = column.enumValues ?? [];
+  const selected = value ? value.split('|') : [];
+  const hasInvalidValue = selected.some((entry) => !options.includes(entry));
+
+  useEffect(() => {
+    if (!open) return;
+    const closeOutsideMenu = (event: MouseEvent) => {
+      const target = event.target as Element | null;
+      if (!containerRef.current?.contains(target) || target?.closest('.enum-cell-display')) setOpen(false);
+    };
+    window.addEventListener('mousedown', closeOutsideMenu);
+    return () => window.removeEventListener('mousedown', closeOutsideMenu);
+  }, [open]);
+
+  useLayoutEffect(() => {
+    if (!open || !containerRef.current || !menuRef.current) return;
+    const containerBounds = containerRef.current.getBoundingClientRect();
+    const scrollBounds = containerRef.current.closest('.table-scroll')?.getBoundingClientRect();
+    const upperBoundary = Math.max(0, scrollBounds?.top ?? 0);
+    const lowerBoundary = Math.min(window.innerHeight, scrollBounds?.bottom ?? window.innerHeight);
+    const spaceAbove = containerBounds.top - upperBoundary;
+    const spaceBelow = lowerBoundary - containerBounds.bottom;
+    const menuHeight = menuRef.current.getBoundingClientRect().height;
+    setMenuOpensUp(menuHeight > spaceBelow && spaceAbove > spaceBelow);
+  }, [column.enumMultiple, open, options.length, selected.length]);
+
+  const toggle = (option: string, checked: boolean) => {
+    const next = options.filter((entry) => entry === option ? checked : selected.includes(entry));
+    onChange(next.join('|'));
+  };
+  const displayValue = column.enumMultiple ? selected.join(', ') : value;
+  return <div
+    ref={containerRef}
+    className="enum-cell"
+    title={hasInvalidValue ? `非法 Enum 值：${value}` : value || undefined}
+  >
+    <span className="enum-cell-display">{displayValue || '—'}</span>
+    <button
+      type="button"
+      className="enum-dropdown-trigger"
+      disabled={disabled}
+      aria-label="显示 Enum 选项"
+      aria-expanded={open}
+      onMouseDown={(event) => event.stopPropagation()}
+      onClick={() => setOpen((current) => !current)}
+    ><ChevronDown size={16} /></button>
+    {open && <div
+      ref={menuRef}
+      className={`enum-dropdown-menu${menuOpensUp ? ' opens-up' : ''}`}
+      onMouseDown={(event) => event.stopPropagation()}
+    >
+      {column.enumMultiple ? <>
+        {options.map((option) => <label key={option}>
+          <input
+            type="checkbox"
+            checked={selected.includes(option)}
+            disabled={disabled}
+            onChange={(event) => toggle(option, event.target.checked)}
+          />
+          <span>{option}</span>
+        </label>)}
+        {selected.length > 0 && <button type="button" className="enum-clear-button" disabled={disabled} onClick={() => onChange('')}>清空</button>}
+      </> : <>
+        {options.map((option) => <button
+          type="button"
+          className={value === option ? 'is-selected' : ''}
+          key={option}
+          onClick={() => { onChange(option); setOpen(false); }}
+        >{option}</button>)}
+      </>}
+    </div>}
+  </div>;
+}
+
 function HeaderContextMenu({ column, isId, canMoveRight, style, onEdit, onDelete, onMoveRight, onAddRight }: {
   column: ColumnSchema;
   isId: boolean;
@@ -1842,13 +1988,31 @@ function ColumnDialog({ mode, column, siblingSheets, onCancel, onSubmit }: {
   column?: ColumnSchema;
   siblingSheets: string[];
   onCancel: () => void;
-  onSubmit: (name: string, type: ColumnType, linkSheet?: string) => void;
+  onSubmit: (name: string, type: ColumnType, linkSheet?: string, enumValues?: string[], enumMultiple?: boolean) => string | undefined;
 }) {
   const [name, setName] = useState(column?.name ?? 'new_column');
   const [type, setType] = useState<ColumnType>(column?.type ?? 'string');
   const [isLink, setIsLink] = useState(column?.editorType === 'link');
   const [linkSheet, setLinkSheet] = useState(column?.linkSheet ?? '');
+  const [enumValues, setEnumValues] = useState<string[]>(column?.enumValues ?? ['']);
+  const [enumMultiple, setEnumMultiple] = useState(Boolean(column?.enumMultiple));
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [draggedEnumIndex, setDraggedEnumIndex] = useState<number | null>(null);
+  const draggedEnumIndexRef = useRef<number | null>(null);
+  const draggedEnumPointerRef = useRef<number | null>(null);
   const supportsLink = type === 'string' || type === 'string_array';
+  const normalizedEnumValues = enumValues.map((value) => value.trim());
+  const enumError = type !== 'enum'
+    ? null
+    : normalizedEnumValues.length === 0
+      ? 'Enum 列必须至少添加一个值。'
+      : normalizedEnumValues.some((value) => !value)
+        ? 'Enum 值不能为空。'
+        : normalizedEnumValues.some((value) => value.includes('|'))
+          ? 'Enum 值不能包含 | 字符。'
+          : new Set(normalizedEnumValues).size !== normalizedEnumValues.length
+            ? 'Enum 值不能重复。'
+            : null;
   useEffect(() => {
     if (!isLink || linkSheet) return;
     setLinkSheet(siblingSheets[0] ?? '');
@@ -1856,11 +2020,30 @@ function ColumnDialog({ mode, column, siblingSheets, onCancel, onSubmit }: {
   useEffect(() => {
     if (!supportsLink && isLink) setIsLink(false);
   }, [isLink, supportsLink]);
-  const submit = () => onSubmit(
-    name,
-    type,
-    isLink ? linkSheet : undefined,
-  );
+  const moveEnumValue = (fromIndex: number, toIndex: number) => {
+    if (fromIndex === toIndex || toIndex < 0 || toIndex >= enumValues.length) return;
+    setEnumValues((current) => {
+      const next = [...current];
+      const [moved] = next.splice(fromIndex, 1);
+      next.splice(toIndex, 0, moved);
+      return next;
+    });
+  };
+  const finishEnumDrag = () => {
+    draggedEnumIndexRef.current = null;
+    draggedEnumPointerRef.current = null;
+    setDraggedEnumIndex(null);
+  };
+  const submit = () => {
+    const error = onSubmit(
+      name,
+      type,
+      isLink ? linkSheet : undefined,
+      type === 'enum' && !enumError ? normalizedEnumValues : undefined,
+      type === 'enum' ? enumMultiple : undefined,
+    );
+    setSubmitError(error ?? null);
+  };
   return <div className="modal-backdrop" role="presentation" onMouseDown={onCancel}>
     <section className="column-dialog" role="dialog" aria-modal="true" aria-label={mode === 'edit' ? '编辑列' : '新增列'} onMouseDown={(event) => event.stopPropagation()}>
       <h2>{mode === 'edit' ? '编辑列' : '在右侧新增列'}</h2>
@@ -1878,7 +2061,65 @@ function ColumnDialog({ mode, column, siblingSheets, onCancel, onSubmit }: {
           {siblingSheets.map((sheet) => <option key={sheet} value={sheet}>{sheet}</option>)}
         </select></label>
       )}
-      <div className="dialog-actions"><button className="button button-secondary" onClick={onCancel}>取消</button><button className="button button-primary" disabled={isLink && !linkSheet} onClick={submit}>确定</button></div>
+      {type === 'enum' && <div className="enum-config">
+        <div className="enum-config-header"><span>Enum 值</span><button type="button" onClick={() => setEnumValues((current) => [...current, ''])}><Plus size={13} />添加</button></div>
+        <div className="enum-value-list">
+          {enumValues.map((value, index) => <div
+            className={`enum-value-row${draggedEnumIndex === index ? ' is-dragging' : ''}`}
+            key={index}
+            data-enum-index={index}
+          >
+            <button
+              type="button"
+              className="enum-drag-handle"
+              aria-label={`上下拖动枚举值 ${index + 1}`}
+              title="上下拖动排序"
+              onPointerDown={(event) => {
+                if (!event.isPrimary || event.button !== 0) return;
+                event.preventDefault();
+                draggedEnumIndexRef.current = index;
+                draggedEnumPointerRef.current = event.pointerId;
+                setDraggedEnumIndex(index);
+                event.currentTarget.setPointerCapture(event.pointerId);
+              }}
+              onPointerMove={(event) => {
+                if (draggedEnumPointerRef.current !== event.pointerId) return;
+                const row = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>('.enum-value-row');
+                const toIndex = Number(row?.dataset.enumIndex);
+                const fromIndex = draggedEnumIndexRef.current;
+                if (fromIndex === null || !Number.isInteger(toIndex) || fromIndex === toIndex) return;
+                moveEnumValue(fromIndex, toIndex);
+                draggedEnumIndexRef.current = toIndex;
+                setDraggedEnumIndex(toIndex);
+              }}
+              onPointerUp={(event) => {
+                if (draggedEnumPointerRef.current === event.pointerId) finishEnumDrag();
+              }}
+              onPointerCancel={finishEnumDrag}
+              onLostPointerCapture={finishEnumDrag}
+              onKeyDown={(event) => {
+                if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return;
+                event.preventDefault();
+                const nextIndex = index + (event.key === 'ArrowUp' ? -1 : 1);
+                moveEnumValue(index, nextIndex);
+              }}
+            ><GripVertical size={15} /></button>
+            <input
+              value={value}
+              placeholder={`枚举值 ${index + 1}`}
+              onChange={(event) => setEnumValues((current) => current.map((entry, entryIndex) => entryIndex === index ? event.target.value : entry))}
+            />
+            <button type="button" aria-label={`删除枚举值 ${index + 1}`} onClick={() => setEnumValues((current) => current.filter((_, entryIndex) => entryIndex !== index))}><Trash2 size={14} /></button>
+          </div>)}
+        </div>
+        <label className="link-option">
+          <input type="checkbox" checked={enumMultiple} onChange={(event) => setEnumMultiple(event.target.checked)} />
+          <span>允许多选</span>
+        </label>
+        {enumError && <div className="enum-config-error"><AlertCircle size={13} />{enumError}</div>}
+      </div>}
+      {submitError && <div className="dialog-error"><AlertCircle size={13} />{submitError}</div>}
+      <div className="dialog-actions"><button className="button button-secondary" onClick={onCancel}>取消</button><button className="button button-primary" disabled={(isLink && !linkSheet) || Boolean(enumError)} onClick={submit}>确定</button></div>
     </section>
   </div>;
 }
@@ -1889,6 +2130,7 @@ function typeLabel(type: ColumnType) {
 
 function columnTypeLabel(column: ColumnSchema) {
   const baseType = typeLabel(column.type);
+  if (column.type === 'enum') return `${baseType} · ${column.enumMultiple ? '多选' : '单选'}`;
   return column.editorType === 'link'
     ? `${baseType} · Link → ${column.linkSheet ?? '?'}`
     : baseType;
