@@ -103,6 +103,9 @@ input[type="checkbox"] { accent-color: var(--gray-12); }
 .cell-input { width: 100%; min-width: 108px; height: 27px; padding: 0 6px; color: var(--gray-12); outline: none; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
 .cell-value { min-width: 108px; min-height: 27px; padding: 4px 6px; line-height: 18px; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; user-select: none; cursor: default; }
 .cell-value.is-empty::after { content: '\00a0'; }
+.bool-cell { min-width: 108px; min-height: 27px; padding: 4px 6px; display: flex; align-items: center; justify-content: center; }
+.bool-cell input { width: 16px; height: 16px; margin: 0; cursor: pointer; }
+.bool-cell input:disabled { cursor: default; }
 .cell-input:focus { outline: none; border: 0; background: transparent; box-shadow: none; }
 .enum-cell { position: relative; min-width: 140px; min-height: 27px; display: grid; grid-template-columns: minmax(0, 1fr) 30px; align-items: stretch; }
 .enum-cell-display { min-width: 0; padding: 5px 6px 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: none; }

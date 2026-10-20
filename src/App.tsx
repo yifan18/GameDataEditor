@@ -176,6 +176,7 @@ export default function App() {
   const [isFolderActionBusy, setIsFolderActionBusy] = useState(false);
   const [headerMenu, setHeaderMenu] = useState<HeaderMenuState | null>(null);
   const [rowMenu, setRowMenu] = useState<RowMenuState | null>(null);
+  const [csvMenu, setCsvMenu] = useState<{ path: string; name: string; x: number; y: number } | null>(null);
   const [columnDialog, setColumnDialog] = useState<ColumnDialogState | null>(null);
   const [siblingSheets, setSiblingSheets] = useState<string[]>([]);
   const [linkTargetRowIndex, setLinkTargetRowIndex] = useState<number | null>(null);
@@ -312,11 +313,11 @@ export default function App() {
     return id;
   }, [displayTab]);
 
-  const closeTab = useCallback((tabId: string) => {
+  const closeTab = useCallback((tabId: string, discardChanges = false) => {
     const closingIndex = tabs.findIndex((tab) => tab.id === tabId);
     if (closingIndex < 0) return;
     const closingTab = tabs[closingIndex];
-    if (closingTab.dirty && !window.confirm(`“${closingTab.title}” 有未保存修改，仍要关闭吗？`)) return;
+    if (!discardChanges && closingTab.dirty && !window.confirm(`“${closingTab.title}” 有未保存修改，仍要关闭吗？`)) return;
 
     const nextTabs = tabs.filter((tab) => tab.id !== tabId);
     tabSessions.current.delete(tabId);
@@ -431,14 +432,24 @@ export default function App() {
   }, [tabs]);
 
   useEffect(() => {
-    if (!headerMenu && !rowMenu) return;
+    if (!headerMenu && !rowMenu && !csvMenu) return;
     const closeMenu = () => {
       setHeaderMenu(null);
       setRowMenu(null);
+      setCsvMenu(null);
     };
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') closeMenu(); };
     window.addEventListener('mousedown', closeMenu);
-    return () => window.removeEventListener('mousedown', closeMenu);
-  }, [headerMenu, rowMenu]);
+    window.addEventListener('keydown', closeOnEscape);
+    window.addEventListener('resize', closeMenu);
+    window.addEventListener('scroll', closeMenu, true);
+    return () => {
+      window.removeEventListener('mousedown', closeMenu);
+      window.removeEventListener('keydown', closeOnEscape);
+      window.removeEventListener('resize', closeMenu);
+      window.removeEventListener('scroll', closeMenu, true);
+    };
+  }, [headerMenu, rowMenu, csvMenu]);
 
   useEffect(() => {
     if (!columnDialog) return;
@@ -584,6 +595,48 @@ export default function App() {
     path,
   );
 
+  const openCsvMenu = (event: React.MouseEvent, entry: FolderTreeEntry) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (isBusy || isFolderActionBusy || !entry.available) return;
+    setHeaderMenu(null);
+    setRowMenu(null);
+    setCsvMenu({ path: entry.path, name: entry.name,
+      x: Math.max(8, Math.min(event.clientX, window.innerWidth - 208)),
+      y: Math.max(8, Math.min(event.clientY, window.innerHeight - 100)) });
+  };
+
+  const revealCsv = async (path: string) => {
+    setCsvMenu(null);
+    try {
+      await api.revealCsvInFolder(path);
+    } catch (error) {
+      window.alert(`无法在文件夹中打开：${messageFrom(error)}`);
+    }
+  };
+
+  const deleteCsv = async (path: string, name: string) => {
+    setCsvMenu(null);
+    if (isBusy || isFolderActionBusy) return;
+    const tab = tabs.find((entry) => entry.path.toLowerCase() === path.toLowerCase());
+    const dirtyWarning = tab?.dirty ? '\n该表有未保存修改，删除后这些修改将被丢弃。' : '';
+    if (!window.confirm(`将“${name}”、同名 Schema、JSON 文件夹及备份一起移到回收站？${dirtyWarning}`)) return;
+    setIsBusy(true);
+    setIsFolderActionBusy(true);
+    try {
+      await api.recycleCsvPackage(path);
+      if (tab) closeTab(tab.id, true);
+      await refreshFolderTree(true);
+      setNotice(`已将“${name}”及关联文件移到回收站。`);
+    } catch (error) {
+      window.alert(`删除失败：${messageFrom(error)}`);
+      await refreshFolderTree(true);
+    } finally {
+      setIsBusy(false);
+      setIsFolderActionBusy(false);
+    }
+  };
+
   const addFolder = async () => {
     setIsFolderActionBusy(true);
     try {
@@ -720,7 +773,7 @@ export default function App() {
     setSelectedCells(new Set());
     setEditingCell(null);
     setLinkTargetRowIndex((current) => current !== null && current >= insertIndex ? current + 1 : current);
-    setNotice(`已在第 ${rowIndex + 1} 行后新增空行，请填写唯一 id。`);
+    setNotice(rowIndex < 0 ? '已新增空行，请填写唯一 id。' : `已在第 ${rowIndex + 1} 行后新增空行，请填写唯一 id。`);
   };
 
   const duplicateSelected = async () => {
@@ -1063,7 +1116,9 @@ export default function App() {
 
   useEffect(() => {
     const handleCopy = (event: ClipboardEvent) => {
-      if (!document || editingCell || selectedCells.size === 0) return;
+      if (event.defaultPrevented || !document || editingCell || selectedCells.size === 0) return;
+      const target = event.target;
+      if (target instanceof Element && target.closest('input, textarea, select, [contenteditable="true"]')) return;
 
       const visiblePositionBySource = new Map(visibleSourceIndices.map((sourceIndex, position) => [sourceIndex, position]));
       const selected = [...selectedCells].map((key) => {
@@ -1091,7 +1146,9 @@ export default function App() {
 
   useEffect(() => {
     const handlePaste = (event: ClipboardEvent) => {
-      if (!document || editingCell || selectedCells.size === 0) return;
+      if (event.defaultPrevented || !document || editingCell || selectedCells.size === 0) return;
+      const target = event.target;
+      if (target instanceof Element && target.closest('input, textarea, select, [contenteditable="true"]')) return;
       const clipboardText = event.clipboardData?.getData('text/plain');
       if (clipboardText === undefined) return;
       event.preventDefault();
@@ -1182,7 +1239,7 @@ export default function App() {
       if (!firstCell) return;
 
       const column = document.schema.columns[firstCell.columnIndex];
-      if (!column || column.type === 'json_ref' || column.editorType === 'link') return;
+      if (!column || column.type === 'json_ref' || column.type === 'bool' || column.editorType === 'link') return;
 
       const historyGroup = selectedCells.size === 1 ? `cell:${firstCell.key}` : `cells:${firstCell.key}`;
       activeHistoryGroup.current = null;
@@ -1221,6 +1278,7 @@ export default function App() {
           onRemoveFolder={removeFolder}
           onToggleFolder={toggleFolder}
           onOpenCsv={openCsvAtPath}
+          onCsvContextMenu={openCsvMenu}
           appearance={appearance}
           onToggleAppearance={() => setAppearance((current) => current === 'dark' ? 'light' : 'dark')}
         />
@@ -1360,7 +1418,7 @@ export default function App() {
                                   onDoubleClick={(event) => {
                                     event.preventDefault();
                                     setSelectedCells(new Set([key]));
-                                    if (column.type !== 'json_ref') {
+                                    if (column.type !== 'json_ref' && column.type !== 'bool') {
                                       setSeededEditingCell(key);
                                       setEditingCell(key);
                                     }
@@ -1380,7 +1438,7 @@ export default function App() {
                                       onChange={(value) => updateCell(rowIndex, columnIndex, value)}
                                       disabled={isBusy}
                                     />
-                                  ) : column.type === 'json_ref' ? (
+                                  ) : column.type === 'json_ref' || column.type === 'bool' ? (
                                     <CellEditor
                                       column={column}
                                       value={row[columnIndex] ?? ''}
@@ -1388,7 +1446,7 @@ export default function App() {
                                       onCreateReference={() => createReference(rowIndex, columnIndex)}
                                       onOpenReference={() => openReference(row[columnIndex])}
                                       disabled={isBusy}
-                                      autoFocus
+                                      autoFocus={column.type === 'json_ref'}
                                     />
                                   ) : column.editorType === 'link' && column.linkSheet ? (
                                     <LinkCell
@@ -1439,16 +1497,26 @@ export default function App() {
           )}
         </section>
       </div>
+      {csvMenu && (
+        <div className="row-context-menu" role="menu" aria-label={`${csvMenu.name} 文件菜单`}
+          style={{ left: csvMenu.x, top: csvMenu.y }} onMouseDown={(event) => event.stopPropagation()}>
+          <button className="menu-item" role="menuitem" onClick={() => void revealCsv(csvMenu.path)}><FolderOpen size={14} />在文件夹中打开</button>
+          <div className="menu-divider" />
+          <button className="menu-item menu-item-danger" role="menuitem" onClick={() => void deleteCsv(csvMenu.path, csvMenu.name)}><Trash2 size={14} />删除</button>
+        </div>
+      )}
       {document && headerMenu && (
         <HeaderContextMenu
           column={document.schema.columns[headerMenu.index]}
           isId={headerMenu.index === 0}
           canMoveRight={headerMenu.index > 0 && headerMenu.index < document.schema.columns.length - 1}
-          style={{ left: Math.min(headerMenu.x, window.innerWidth - 220), top: Math.min(headerMenu.y, window.innerHeight - 220) }}
+          disabled={isBusy}
+          style={{ left: Math.min(headerMenu.x, window.innerWidth - 220), top: Math.min(headerMenu.y, window.innerHeight - 260) }}
           onEdit={() => { setColumnDialog({ mode: 'edit', index: headerMenu.index }); setHeaderMenu(null); }}
           onDelete={() => { deleteColumn(headerMenu.index); setHeaderMenu(null); }}
           onMoveRight={() => { moveColumn(headerMenu.index, 1); setHeaderMenu(null); }}
           onAddRight={() => { setColumnDialog({ mode: 'add', index: headerMenu.index + 1 }); setHeaderMenu(null); }}
+          onAddRow={() => { setHeaderMenu(null); addRowAfter(document.rows.length - 1); }}
         />
       )}
       {document && rowMenu && (
@@ -1488,6 +1556,7 @@ function FolderSidebar({
   onRemoveFolder,
   onToggleFolder,
   onOpenCsv,
+  onCsvContextMenu,
   appearance,
   onToggleAppearance,
 }: {
@@ -1502,6 +1571,7 @@ function FolderSidebar({
   onRemoveFolder: (root: FolderTreeRoot) => Promise<void>;
   onToggleFolder: (path: string) => void;
   onOpenCsv: (path: string) => Promise<void | undefined>;
+  onCsvContextMenu: (event: React.MouseEvent, entry: FolderTreeEntry) => void;
   appearance: AppAppearance;
   onToggleAppearance: () => void;
 }) {
@@ -1565,10 +1635,11 @@ function FolderSidebar({
           expandedFolders={expandedFolders}
           activeCsvPath={activeCsvPath}
           isActionBusy={isActionBusy}
-          isOpenBusy={isOpenBusy}
+          isOpenBusy={isOpenBusy || isActionBusy}
           onToggleFolder={onToggleFolder}
           onRemoveFolder={onRemoveFolder}
           onOpenCsv={onOpenCsv}
+          onCsvContextMenu={onCsvContextMenu}
         />
       ))}
     </div>
@@ -1585,6 +1656,7 @@ function FolderRootItem({
   onToggleFolder,
   onRemoveFolder,
   onOpenCsv,
+  onCsvContextMenu,
 }: {
   root: FolderTreeRoot;
   expanded: boolean;
@@ -1595,6 +1667,7 @@ function FolderRootItem({
   onToggleFolder: (path: string) => void;
   onRemoveFolder: (root: FolderTreeRoot) => Promise<void>;
   onOpenCsv: (path: string) => Promise<void | undefined>;
+  onCsvContextMenu: (event: React.MouseEvent, entry: FolderTreeEntry) => void;
 }) {
   const rootError = root.error ?? (root.available ? null : '该文件夹当前不可访问。');
   return <div className={`folder-root${root.available ? '' : ' is-unavailable'}`}>
@@ -1639,6 +1712,7 @@ function FolderRootItem({
             isOpenBusy={isOpenBusy}
             onToggleFolder={onToggleFolder}
             onOpenCsv={onOpenCsv}
+            onCsvContextMenu={onCsvContextMenu}
           />
         ))}
       </div>
@@ -1654,6 +1728,7 @@ function FolderTreeItem({
   isOpenBusy,
   onToggleFolder,
   onOpenCsv,
+  onCsvContextMenu,
 }: {
   entry: FolderTreeEntry;
   depth: number;
@@ -1662,6 +1737,7 @@ function FolderTreeItem({
   isOpenBusy: boolean;
   onToggleFolder: (path: string) => void;
   onOpenCsv: (path: string) => Promise<void | undefined>;
+  onCsvContextMenu: (event: React.MouseEvent, entry: FolderTreeEntry) => void;
 }) {
   const indent = 13 + depth * 16;
   const entryAvailable = entry.available;
@@ -1672,6 +1748,7 @@ function FolderTreeItem({
         className={`folder-tree-row csv-tree-item${activeCsvPath === entry.path ? ' is-active' : ''}${entryAvailable ? '' : ' is-unavailable'}`}
         style={{ paddingLeft: indent }}
         onClick={() => void onOpenCsv(entry.path)}
+        onContextMenu={(event) => onCsvContextMenu(event, entry)}
         disabled={isOpenBusy || !entryAvailable}
         role="treeitem"
         aria-level={depth + 1}
@@ -1717,6 +1794,7 @@ function FolderTreeItem({
             isOpenBusy={isOpenBusy}
             onToggleFolder={onToggleFolder}
             onOpenCsv={onOpenCsv}
+            onCsvContextMenu={onCsvContextMenu}
           />
         ))}
       </div>
@@ -1750,9 +1828,18 @@ function CellEditor({ column, value, onChange, onCreateReference, onOpenReferenc
     ) : <button className="json-create" onClick={onCreateReference} disabled={disabled} autoFocus={autoFocus}><Plus size={14} />新建 JSON</button>;
   }
   if (column.type === 'bool') {
-    return <select className="cell-input" value={value} onChange={(event) => onChange(event.target.value)} autoFocus={autoFocus}>
-      <option value="">—</option><option value="true">true</option><option value="false">false</option>
-    </select>;
+    return <div className="bool-cell">
+      <input
+        type="checkbox"
+        aria-label={column.name}
+        checked={value === 'true'}
+        onChange={(event) => onChange(event.target.checked ? 'true' : 'false')}
+        onMouseDown={(event) => event.stopPropagation()}
+        onDoubleClick={(event) => event.stopPropagation()}
+        disabled={disabled}
+        autoFocus={autoFocus}
+      />
+    </div>;
   }
   if (column.type === 'string') {
     return <TextCellEditor value={value} onChange={onChange} autoFocus={autoFocus} selectOnFocus={selectOnFocus} />;
@@ -1943,15 +2030,17 @@ function EnumCellEditor({ column, value, onChange, disabled }: {
   </div>;
 }
 
-function HeaderContextMenu({ column, isId, canMoveRight, style, onEdit, onDelete, onMoveRight, onAddRight }: {
+function HeaderContextMenu({ column, isId, canMoveRight, disabled, style, onEdit, onDelete, onMoveRight, onAddRight, onAddRow }: {
   column: ColumnSchema;
   isId: boolean;
   canMoveRight: boolean;
+  disabled: boolean;
   style: React.CSSProperties;
   onEdit: () => void;
   onDelete: () => void;
   onMoveRight: () => void;
   onAddRight: () => void;
+  onAddRow: () => void;
 }) {
   return <div className="header-context-menu" style={style} onMouseDown={(event) => event.stopPropagation()}>
     <div className="menu-heading">{column.name} <span>{columnTypeLabel(column)}</span></div>
@@ -1959,6 +2048,7 @@ function HeaderContextMenu({ column, isId, canMoveRight, style, onEdit, onDelete
     <button className="menu-item" disabled={isId} onClick={onEdit}>编辑名称和类型</button>
     <button className="menu-item" disabled={!canMoveRight} onClick={onMoveRight}>向右移动</button>
     <button className="menu-item" onClick={onAddRight}>在右侧新增一列</button>
+    <button className="menu-item" disabled={disabled} onClick={onAddRow}><Plus size={14} />添加行</button>
     <div className="menu-divider" />
     <button className="menu-item menu-item-danger" disabled={isId} onClick={onDelete}>删除列</button>
   </div>;

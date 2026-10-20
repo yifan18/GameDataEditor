@@ -16,6 +16,8 @@ export const api = {
     invoke<FolderTreeRoot[]>('remove_folder_root', { path }),
   openCsvAtPath: (path: string) =>
     invoke<TableDocument>('open_csv_from_folder', { path }),
+  recycleCsvPackage: (path: string) => invoke<void>('recycle_csv_package', { path }),
+  revealCsvInFolder: (path: string) => invoke<void>('reveal_csv_in_folder', { path }),
   activateCsvSession: (path: string) =>
     invoke<void>('activate_csv_session', { path }),
   listSiblingSheets: () => invoke<string[]>('list_sibling_sheets'),

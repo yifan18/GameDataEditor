@@ -327,6 +327,138 @@ fn list_sibling_sheets(state: tauri::State<'_, AppState>) -> Result<Vec<String>,
     sibling_sheet_names(&session.csv_path)
 }
 
+fn csv_package_paths(csv_path: &Path) -> Result<Vec<PathBuf>, String> {
+    let parent = csv_path.parent().ok_or("CSV 缺少上级目录。")?;
+    let table_name = csv_path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .ok_or("CSV 文件名无效。")?;
+    let csv_name = csv_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("CSV 文件名无效。")?;
+    let mut paths = Vec::new();
+    for name in [
+        format!("{csv_name}.bak"),
+        format!("{table_name}.schema.json"),
+        format!("{table_name}.schema.json.bak"),
+        table_name.to_string(),
+    ] {
+        let path = parent.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                if path_contains_symlink_or_reparse(&path)? {
+                    return Err(format!(
+                        "关联文件不能穿过符号链接或重解析点：{}",
+                        path.display()
+                    ));
+                }
+                let resolved = path
+                    .canonicalize()
+                    .map_err(|error| format!("无法访问关联文件：{error}"))?;
+                if resolved.parent() != Some(parent) {
+                    return Err("关联文件不在 CSV 所在目录中。".to_string());
+                }
+                paths.push(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("无法读取关联文件：{error}")),
+        }
+    }
+    // Keep the CSV until its companions have been moved successfully.
+    paths.push(csv_path.to_path_buf());
+    Ok(paths)
+}
+
+fn recycle_package_files(paths: &[PathBuf]) -> Result<(), String> {
+    for target in paths {
+        trash::delete(target).map_err(|error| {
+            format!(
+                "无法移到回收站：{}：{error}。此前已移动的文件可从回收站还原。",
+                target.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn recycle_csv_package(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<(), String> {
+    let roots = state
+        .folders
+        .lock()
+        .map_err(|_| "无法锁定目录收藏。")?
+        .roots
+        .clone();
+    let csv_path = validate_csv_path_in_roots(Path::new(&path), &roots)?;
+    let paths = csv_package_paths(&csv_path)?;
+    let mut session = state.session.lock().map_err(|_| "无法锁定当前文件会话。")?;
+    let mut cache = state
+        .session_cache
+        .lock()
+        .map_err(|_| "无法锁定文件会话缓存。")?;
+    if let Err(error) = recycle_package_files(&paths) {
+        emit_folder_tree_changed(&app);
+        return Err(error);
+    }
+    let key = folder_path_key(&csv_path);
+    cache.remove(&key);
+    if session
+        .as_ref()
+        .is_some_and(|active| folder_path_key(&active.csv_path) == key)
+    {
+        *session = None;
+    }
+    emit_folder_tree_changed(&app);
+    Ok(())
+}
+
+#[tauri::command]
+fn reveal_csv_in_folder(state: tauri::State<'_, AppState>, path: String) -> Result<(), String> {
+    let roots = state
+        .folders
+        .lock()
+        .map_err(|_| "无法锁定目录收藏。")?
+        .roots
+        .clone();
+    let csv_path = validate_csv_path_in_roots(Path::new(&path), &roots)?;
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = Command::new("explorer.exe");
+        let display_path = path_to_string(&csv_path);
+        let display_path = if let Some(network_path) = display_path.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{network_path}")
+        } else {
+            display_path
+                .strip_prefix(r"\\?\")
+                .unwrap_or(&display_path)
+                .to_string()
+        };
+        command.arg(format!("/select,{display_path}"));
+        command
+    };
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg("-R").arg(&csv_path);
+        command
+    };
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(csv_path.parent().ok_or("CSV 缺少上级目录。")?);
+        command
+    };
+    command
+        .spawn()
+        .map_err(|error| format!("无法打开文件夹：{error}"))?;
+    Ok(())
+}
+
 #[tauri::command]
 fn open_linked_row(
     state: tauri::State<'_, AppState>,
@@ -473,8 +605,8 @@ fn save_document(
     let csv_content = serialize_csv(&document)?;
 
     let original_schema = read_optional(&session.schema_path)?;
-    write_backup_and_replace(&session.schema_path, &schema_content)?;
-    if let Err(error) = write_backup_and_replace(&session.csv_path, &csv_content) {
+    write_and_replace(&session.schema_path, &schema_content)?;
+    if let Err(error) = write_and_replace(&session.csv_path, &csv_content) {
         restore_file(&session.schema_path, original_schema.as_deref())?;
         return Err(format!("CSV 保存失败，Schema 已回滚：{error}"));
     }
@@ -653,7 +785,7 @@ fn save_folder_roots_to_path(path: &Path, roots: &[FolderRootRecord]) -> Result<
         roots: roots.to_vec(),
     })
     .map_err(|error| format!("无法序列化目录收藏：{error}"))?;
-    write_backup_and_replace(path, &content).map_err(|error| format!("无法保存目录收藏：{error}"))
+    write_and_replace(path, &content).map_err(|error| format!("无法保存目录收藏：{error}"))
 }
 
 fn deduplicate_folder_roots(roots: Vec<FolderRootRecord>) -> Vec<FolderRootRecord> {
@@ -1625,17 +1757,17 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, String> {
     }
     fs::read(path)
         .map(Some)
-        .map_err(|error| format!("无法读取备份内容：{error}"))
+        .map_err(|error| format!("无法读取原文件内容：{error}"))
 }
 
-fn write_backup_and_replace(path: &Path, content: &[u8]) -> Result<(), String> {
+fn write_and_replace(path: &Path, content: &[u8]) -> Result<(), String> {
     let parent = path.parent().ok_or("目标文件缺少上级目录。")?;
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or("目标文件名无效。")?;
     let temporary = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
-    {
+    let result = (|| {
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1645,33 +1777,20 @@ fn write_backup_and_replace(path: &Path, content: &[u8]) -> Result<(), String> {
             .map_err(|error| format!("无法写入临时文件：{error}"))?;
         file.sync_all()
             .map_err(|error| format!("无法完成临时文件写入：{error}"))?;
+        drop(file);
+        // Rename replaces the destination without deleting it first. On failure,
+        // the original remains available for the caller's rollback handling.
+        fs::rename(&temporary, path).map_err(|error| format!("无法替换原文件：{error}"))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
     }
-    let backup = parent.join(format!("{file_name}.bak"));
-    if path.exists() {
-        fs::copy(path, &backup).map_err(|error| format!("无法创建文件备份：{error}"))?;
-    }
-    match fs::rename(&temporary, path) {
-        Ok(()) => Ok(()),
-        Err(first_error) => {
-            if path.exists() {
-                fs::remove_file(path).map_err(|error| format!("无法替换原文件：{error}"))?;
-            }
-            if let Err(second_error) = fs::rename(&temporary, path) {
-                if backup.exists() {
-                    let _ = fs::copy(&backup, path);
-                }
-                return Err(format!(
-                    "无法替换原文件：{first_error}; 重试失败：{second_error}"
-                ));
-            }
-            Ok(())
-        }
-    }
+    result
 }
 
 fn restore_file(path: &Path, original: Option<&[u8]>) -> Result<(), String> {
     match original {
-        Some(content) => write_backup_and_replace(path, content),
+        Some(content) => write_and_replace(path, content),
         None if path.exists() => {
             fs::remove_file(path).map_err(|error| format!("无法回滚新建 Schema：{error}"))
         }
@@ -1728,6 +1847,8 @@ pub fn run() {
             list_folder_tree,
             remove_folder_root,
             open_csv_from_folder,
+            recycle_csv_package,
+            reveal_csv_in_folder,
             activate_csv_session,
             list_sibling_sheets,
             open_linked_row,
@@ -1754,6 +1875,126 @@ mod tests {
             std::env::temp_dir().join(format!("game-data-editor-{label}-{}", Uuid::new_v4()));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn csv_package_paths_include_companions_and_exclude_other_tables() {
+        let root = test_directory("csv-package-paths");
+        for name in [
+            "Hero.csv",
+            "Hero.csv.bak",
+            "Hero.schema.json",
+            "Hero.schema.json.bak",
+            "HeroExtra.csv",
+            "HeroExtra.schema.json",
+            "notes.txt",
+        ] {
+            fs::write(root.join(name), b"test").unwrap();
+        }
+        fs::create_dir(root.join("Hero")).unwrap();
+        fs::write(root.join("Hero").join("record.json"), b"{}").unwrap();
+        fs::create_dir(root.join("HeroExtra")).unwrap();
+        let csv_path = root.join("Hero.csv").canonicalize().unwrap();
+        let paths = csv_package_paths(&csv_path).unwrap();
+        let names: Vec<_> = paths
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "Hero.csv.bak",
+                "Hero.schema.json",
+                "Hero.schema.json.bak",
+                "Hero",
+                "Hero.csv"
+            ]
+        );
+        assert_eq!(paths.last(), Some(&csv_path));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn csv_package_paths_allow_missing_companions() {
+        let root = test_directory("csv-package-missing");
+        fs::write(root.join("Hero.csv"), b"id\n1\n").unwrap();
+        let csv_path = root.join("Hero.csv").canonicalize().unwrap();
+        assert_eq!(csv_package_paths(&csv_path).unwrap(), vec![csv_path]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn saving_replaces_files_without_generating_backups() {
+        let root = test_directory("save-without-backup");
+        for name in ["Hero.csv", "Hero.schema.json", "folder-roots.json"] {
+            let path = root.join(name);
+            write_and_replace(&path, b"first").unwrap();
+            write_and_replace(&path, b"second").unwrap();
+            assert_eq!(fs::read(&path).unwrap(), b"second");
+            assert!(!root.join(format!("{name}.bak")).exists());
+        }
+        let path = root.join("Hero.csv");
+        fs::write(root.join("Hero.csv.bak"), b"existing backup").unwrap();
+        write_and_replace(&path, b"third").unwrap();
+        assert_eq!(
+            fs::read(root.join("Hero.csv.bak")).unwrap(),
+            b"existing backup"
+        );
+        restore_file(&path, Some(b"second")).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 4);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_replacement_preserves_destination_and_cleans_temporary_file() {
+        let root = test_directory("save-replace-failure");
+        let destination = root.join("Hero.csv");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("original.txt"), b"original").unwrap();
+        assert!(write_and_replace(&destination, b"replacement").is_err());
+        assert_eq!(
+            fs::read(destination.join("original.txt")).unwrap(),
+            b"original"
+        );
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "Uses the Windows Recycle Bin and restores only its own temporary fixture"]
+    fn csv_package_recycles_and_restores_all_related_files() {
+        let root = test_directory("recycle-integration");
+        for name in [
+            "Hero.csv",
+            "Hero.csv.bak",
+            "Hero.schema.json",
+            "Hero.schema.json.bak",
+            "Other.csv",
+        ] {
+            fs::write(root.join(name), b"fixture").unwrap();
+        }
+        fs::create_dir(root.join("Hero")).unwrap();
+        fs::write(root.join("Hero").join("record.json"), b"{}").unwrap();
+        let csv_path = root.join("Hero.csv").canonicalize().unwrap();
+        let paths = csv_package_paths(&csv_path).unwrap();
+        recycle_package_files(&paths).unwrap();
+        assert!(paths.iter().all(|path| !path.exists()));
+        assert!(root.join("Other.csv").exists());
+        let items: Vec<_> = trash::os_limited::list()
+            .unwrap()
+            .into_iter()
+            .filter(|item| folder_paths_match(&item.original_parent, &root))
+            .collect();
+        assert_eq!(items.len(), paths.len());
+        trash::os_limited::restore_all(items).unwrap();
+        assert!(paths.iter().all(|path| path.exists()));
+        assert_eq!(
+            fs::read(root.join("Hero").join("record.json")).unwrap(),
+            b"{}"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
