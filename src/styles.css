@@ -130,6 +130,7 @@ input[type="checkbox"] { accent-color: var(--gray-12); }
 .link-tag-remove { width: 27px; flex: 0 0 27px; display: inline-grid; place-items: center; }
 .link-tag-label:hover:not(:disabled), .link-tag-remove:hover:not(:disabled) { background: rgba(255, 255, 255, .15); }
 .link-tags-input { min-width: 160px; height: 25px; padding: 0 6px; flex: 1; border: 0; color: var(--gray-12); outline: 0; background: transparent; font-size: 11px; }
+.link-tags-input.has-tags { min-width: 40px; width: 0; flex-basis: 40px; }
 .link-tags-input::placeholder { color: var(--gray-8); }
 .icon-button { width: 26px; height: 26px; display: inline-grid; place-items: center; border: 1px solid transparent; border-radius: var(--radius-1); color: var(--gray-11); background: transparent; }
 .danger-icon:hover:not(:disabled) { color: var(--red-11); background: var(--red-3); }

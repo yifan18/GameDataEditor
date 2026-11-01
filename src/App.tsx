@@ -129,6 +129,18 @@ interface DocumentTabSession {
   savedSnapshot: string;
   issues: ValidationIssue[];
   undoHistory: TableDocument[];
+  view?: DocumentTabView;
+}
+
+interface DocumentTabView {
+  scrollTop: number;
+  scrollLeft: number;
+  selectedRows: Set<number>;
+  selectedCells: Set<string>;
+  focusedCell: string | null;
+  sorting: Array<{ id: string; desc: boolean }>;
+  columnFilters: Array<{ id: string; value: unknown }>;
+  globalFilter: unknown;
 }
 
 const cellKey = (rowIndex: number, columnIndex: number) => `${rowIndex}:${columnIndex}`;
@@ -163,7 +175,25 @@ export default function App() {
   const [issues, setIssues] = useState<ValidationIssue[]>([]);
   const [selectedRows, setSelectedRows] = useState<Set<number>>(new Set());
   const [selectedCells, setSelectedCells] = useState<Set<string>>(new Set());
-  const [editingCell, setEditingCell] = useState<string | null>(null);
+  const [editingCell, setEditingCellState] = useState<string | null>(null);
+  const [editingColumnWidths, setEditingColumnWidths] = useState<number[]>([]);
+  const gridRef = useRef<HTMLTableElement>(null);
+  const tableScrollRef = useRef<HTMLDivElement>(null);
+  const focusedCellRef = useRef<string | null>(null);
+  const captureTabView = useRef<() => DocumentTabView>();
+  const pendingTabView = useRef<DocumentTabView | null>(null);
+  const renderedTabId = useRef<string | null>(null);
+  const pendingRowFocus = useRef<number | null>(null);
+  const setEditingCell = useCallback((key: string | null) => {
+    if (key !== null) {
+      // Measure before replacing the displayed value or overwriting it from the keyboard.
+      const headers = gridRef.current?.tHead?.rows[0]?.cells;
+      setEditingColumnWidths(headers
+        ? Array.from(headers, (header) => header.getBoundingClientRect().width)
+        : []);
+    }
+    setEditingCellState(key);
+  }, []);
   const [seededEditingCell, setSeededEditingCell] = useState<string | null>(null);
   const [folderRoots, setFolderRoots] = useState<FolderTreeRoot[]>([]);
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
@@ -251,6 +281,15 @@ export default function App() {
   const displayTab = useCallback((tabId: string) => {
     const session = tabSessions.current.get(tabId);
     if (!session) return;
+    if (tabId === activeTabIdRef.current) return;
+    const previousSession = activeTabIdRef.current
+      ? tabSessions.current.get(activeTabIdRef.current)
+      : undefined;
+    if (previousSession && captureTabView.current) previousSession.view = captureTabView.current();
+    pendingTabView.current = session.view ?? null;
+    pendingRowFocus.current = null;
+    dragSelectionStart.current = null;
+    focusedCellRef.current = session.view?.focusedCell ?? null;
     activeTabIdRef.current = tabId;
     setActiveTabId(tabId);
     documentRef.current = session.document;
@@ -262,9 +301,10 @@ export default function App() {
     undoHistory.current = session.undoHistory;
     activeHistoryGroup.current = null;
     setActiveCsvPath(session.document.sourcePath);
-    setSelectedRows(new Set());
-    setSelectedCells(new Set());
+    setSelectedRows(new Set(session.view?.selectedRows));
+    setSelectedCells(new Set(session.view?.selectedCells));
     setEditingCell(null);
+    setSeededEditingCell(null);
     setHeaderMenu(null);
     setRowMenu(null);
     setColumnDialog(null);
@@ -385,6 +425,16 @@ export default function App() {
     globalFilterFn: filterFn_includesString,
     getRowId: (row) => String(row.sourceIndex),
   });
+  captureTabView.current = () => ({
+    scrollTop: tableScrollRef.current?.scrollTop ?? 0,
+    scrollLeft: tableScrollRef.current?.scrollLeft ?? 0,
+    selectedRows: new Set(selectedRows),
+    selectedCells: new Set(selectedCells),
+    focusedCell: focusedCellRef.current,
+    sorting: [...dataTable.state.sorting],
+    columnFilters: [...dataTable.state.columnFilters],
+    globalFilter: dataTable.state.globalFilter,
+  });
   const folderWatchNeedsRetry = useMemo(
     () => folderRoots.some((root) => !root.available || Boolean(root.error)),
     [folderRoots],
@@ -415,10 +465,31 @@ export default function App() {
     return () => window.clearTimeout(timeout);
   }, [document]);
 
-  useEffect(() => {
-    dataTable.resetSorting(true);
-    dataTable.resetColumnFilters(true);
-    dataTable.resetGlobalFilter(true);
+  useLayoutEffect(() => {
+    const tabChanged = renderedTabId.current !== activeTabId;
+    renderedTabId.current = activeTabId;
+    const view = pendingTabView.current;
+    pendingTabView.current = null;
+    dataTable.setSorting(view?.sorting ?? []);
+    dataTable.setColumnFilters(view?.columnFilters ?? []);
+    dataTable.setGlobalFilter(view?.globalFilter ?? undefined);
+    if (!tabChanged) return;
+    // Restore after the saved sort/filter state has rendered the target rows.
+    const frame = window.requestAnimationFrame(() => {
+      const cell = view?.focusedCell
+        ? gridRef.current?.querySelector<HTMLElement>(`[data-cell-key="${view.focusedCell}"]`)
+        : null;
+      const rowIndex = view?.selectedRows.values().next().value;
+      const row = rowIndex !== undefined
+        ? gridRef.current?.querySelector<HTMLElement>(`[data-row-index="${rowIndex}"]`)
+        : null;
+      (cell ?? row)?.focus({ preventScroll: true });
+      if (tableScrollRef.current) {
+        tableScrollRef.current.scrollTop = view?.scrollTop ?? 0;
+        tableScrollRef.current.scrollLeft = view?.scrollLeft ?? 0;
+      }
+    });
+    return () => window.cancelAnimationFrame(frame);
   }, [activeTabId, document?.tableName, columnSchemaSignature]);
 
   useEffect(() => {
@@ -764,6 +835,7 @@ export default function App() {
 
   const addRowAfter = (rowIndex: number) => {
     const insertIndex = rowIndex + 1;
+    pendingRowFocus.current = insertIndex;
     changeDocument((current) => {
       const next = cloneDocument(current);
       next.rows.splice(insertIndex, 0, makeRow(next.schema.columns.length));
@@ -772,8 +844,25 @@ export default function App() {
     setSelectedRows(new Set([insertIndex]));
     setSelectedCells(new Set());
     setEditingCell(null);
-    setLinkTargetRowIndex((current) => current !== null && current >= insertIndex ? current + 1 : current);
+    setLinkTargetRowIndex(null);
     setNotice(rowIndex < 0 ? '已新增空行，请填写唯一 id。' : `已在第 ${rowIndex + 1} 行后新增空行，请填写唯一 id。`);
+  };
+
+  const moveRow = (rowIndex: number, direction: -1 | 1) => {
+    const targetIndex = rowIndex + direction;
+    if (!document || isBusy || selectedRows.size !== 1 || rowIndex < 0 || rowIndex >= document.rows.length || targetIndex < 0 || targetIndex >= document.rows.length) return;
+    changeDocument((current) => {
+      const next = cloneDocument(current);
+      [next.rows[rowIndex], next.rows[targetIndex]] = [next.rows[targetIndex], next.rows[rowIndex]];
+      return next;
+    });
+    dataTable.resetSorting(true);
+    setSelectedRows(new Set([targetIndex]));
+    setSelectedCells(new Set());
+    setEditingCell(null);
+    dragSelectionStart.current = null;
+    setLinkTargetRowIndex((current) => current === rowIndex ? targetIndex : current === targetIndex ? rowIndex : current);
+    setNotice(`已将第 ${rowIndex + 1} 行${direction === -1 ? '上移' : '下移'}至第 ${targetIndex + 1} 行。`);
   };
 
   const duplicateSelected = async () => {
@@ -1057,6 +1146,21 @@ export default function App() {
   }, [isBusy, undoDocument]);
 
   const visibleTableRows = dataTable.getRowModel().rows;
+  useLayoutEffect(() => {
+    const rowIndex = pendingRowFocus.current;
+    if (rowIndex === null) return;
+    const row = gridRef.current?.querySelector<HTMLTableRowElement>(`[data-row-index="${rowIndex}"]`);
+    if (!row) {
+      // A blank row may not match the active filters; reveal it before focusing.
+      dataTable.resetColumnFilters(true);
+      dataTable.resetGlobalFilter(true);
+      return;
+    }
+    pendingRowFocus.current = null;
+    row.style.scrollMarginTop = `${gridRef.current?.tHead?.getBoundingClientRect().height ?? 0}px`;
+    row.focus({ preventScroll: true });
+    row.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  });
   const visibleSourceIndices = visibleTableRows.map((row) => row.original.sourceIndex);
   const selectCellRange = useCallback((start: CellPosition, end: CellPosition) => {
     const next = new Set<string>();
@@ -1077,6 +1181,7 @@ export default function App() {
   const beginCellSelection = (event: React.MouseEvent, rowPosition: number, columnIndex: number) => {
     if (event.button !== 0) return;
     const key = cellKey(visibleSourceIndices[rowPosition], columnIndex);
+    focusedCellRef.current = key;
     const interactiveTarget = (event.target as HTMLElement).closest('input, textarea, select, button');
     if (interactiveTarget && (editingCell === key || interactiveTarget.tagName === 'BUTTON')) return;
     event.preventDefault();
@@ -1339,8 +1444,19 @@ export default function App() {
                 {document.schemaWasMissing && (
                   <div className="info-banner"><AlertCircle size={16} />未找到同名 Schema；首次保存会创建 <code>{document.tableName}.schema.json</code>。</div>
                 )}
-                <div className="table-scroll">
-                  <table className="data-grid">
+                <div className="table-scroll" ref={tableScrollRef}>
+                  <table
+                    ref={gridRef}
+                    className="data-grid"
+                    style={editingCell && editingColumnWidths.length === document.schema.columns.length + 1
+                      ? { tableLayout: 'fixed', width: editingColumnWidths.reduce((sum, width) => sum + width, 0), minWidth: 0 }
+                      : undefined}
+                  >
+                    {editingCell && editingColumnWidths.length === document.schema.columns.length + 1 && (
+                      <colgroup>
+                        {editingColumnWidths.map((width, index) => <col key={index} style={{ width }} />)}
+                      </colgroup>
+                    )}
                     <thead>
                       {dataTable.getHeaderGroups().map((headerGroup) => (
                         <tr key={headerGroup.id}>
@@ -1390,6 +1506,7 @@ export default function App() {
                           <tr
                             key={tableRow.id}
                             data-row-index={rowIndex}
+                            tabIndex={-1}
                             onContextMenu={(event) => openRowMenu(event, rowIndex)}
                             onMouseEnter={() => {
                               if (linkTargetRowIndex === rowIndex) setLinkTargetRowIndex(null);
@@ -1411,6 +1528,9 @@ export default function App() {
                               return (
                                 <td
                                   key={`${rowIndex}-${column.name}`}
+                                  data-cell-key={key}
+                                  tabIndex={-1}
+                                  onFocus={() => { focusedCellRef.current = key; }}
                                   className={classNames}
                                   title={issueByCell.get(`${rowIndex}:${column.name}`)?.map((issue) => issue.message).join('\n')}
                                   onMouseDown={(event) => beginCellSelection(event, rowPosition, columnIndex)}
@@ -1446,7 +1566,6 @@ export default function App() {
                                       onCreateReference={() => createReference(rowIndex, columnIndex)}
                                       onOpenReference={() => openReference(row[columnIndex])}
                                       disabled={isBusy}
-                                      autoFocus={column.type === 'json_ref'}
                                     />
                                   ) : column.editorType === 'link' && column.linkSheet ? (
                                     <LinkCell
@@ -1523,9 +1642,13 @@ export default function App() {
         <RowContextMenu
           selectionCount={selectedRows.has(rowMenu.rowIndex) ? selectedRows.size : 1}
           disabled={isBusy}
-          style={{ left: Math.min(rowMenu.x, window.innerWidth - 220), top: Math.min(rowMenu.y, window.innerHeight - 190) }}
+          canMoveUp={rowMenu.rowIndex > 0}
+          canMoveDown={rowMenu.rowIndex < document.rows.length - 1}
+          style={{ left: Math.max(0, Math.min(rowMenu.x, window.innerWidth - 220)), top: Math.max(0, Math.min(rowMenu.y, window.innerHeight - 280)) }}
           onAdd={() => { const rowIndex = rowMenu.rowIndex; setRowMenu(null); addRowAfter(rowIndex); }}
           onDuplicate={() => { setRowMenu(null); void duplicateSelected(); }}
+          onMoveUp={() => { moveRow(rowMenu.rowIndex, -1); setRowMenu(null); }}
+          onMoveDown={() => { moveRow(rowMenu.rowIndex, 1); setRowMenu(null); }}
           onDelete={() => { setRowMenu(null); void deleteSelected(); }}
           onCleanOrphans={() => { setRowMenu(null); void cleanOrphans(); }}
         />
@@ -1884,10 +2007,10 @@ function LinkCell({ value, tableName, isArray, disabled, onOpen, onChange, onFoc
     ))}
     {(isArray || values.length === 0) && (
       <input
-        className="link-tags-input"
+        className={`link-tags-input${values.length > 0 ? ' has-tags' : ''}`}
         value={input}
         disabled={disabled}
-        placeholder="按回车键 Enter 创建标签"
+        placeholder={values.length === 0 ? '按回车键 Enter 创建标签' : undefined}
         onFocus={onFocus}
         onChange={(event) => setInput(event.target.value)}
         onKeyDown={(event) => {
@@ -2054,12 +2177,16 @@ function HeaderContextMenu({ column, isId, canMoveRight, disabled, style, onEdit
   </div>;
 }
 
-function RowContextMenu({ selectionCount, disabled, style, onAdd, onDuplicate, onDelete, onCleanOrphans }: {
+function RowContextMenu({ selectionCount, disabled, canMoveUp, canMoveDown, style, onAdd, onDuplicate, onMoveUp, onMoveDown, onDelete, onCleanOrphans }: {
   selectionCount: number;
   disabled: boolean;
+  canMoveUp: boolean;
+  canMoveDown: boolean;
   style: React.CSSProperties;
   onAdd: () => void;
   onDuplicate: () => void;
+  onMoveUp: () => void;
+  onMoveDown: () => void;
   onDelete: () => void;
   onCleanOrphans: () => void;
 }) {
@@ -2067,6 +2194,8 @@ function RowContextMenu({ selectionCount, disabled, style, onAdd, onDuplicate, o
     <div className="menu-heading">{selectionCount > 1 ? `已选择 ${selectionCount} 行` : '当前行'}</div>
     <button className="menu-item" disabled={disabled} onClick={onAdd}><Plus size={14} />新增行</button>
     <button className="menu-item" disabled={disabled || selectionCount !== 1} onClick={onDuplicate}><Copy size={14} />复制行</button>
+    <button className="menu-item" disabled={disabled || selectionCount !== 1 || !canMoveUp} onClick={onMoveUp}><ArrowUp size={14} />上移</button>
+    <button className="menu-item" disabled={disabled || selectionCount !== 1 || !canMoveDown} onClick={onMoveDown}><ArrowDown size={14} />下移</button>
     <button className="menu-item menu-item-danger" disabled={disabled || selectionCount === 0} onClick={onDelete}><Trash2 size={14} />删除行</button>
     <div className="menu-divider" />
     <button className="menu-item" disabled={disabled} onClick={onCleanOrphans}><Trash2 size={14} />清理未引用 JSON</button>
